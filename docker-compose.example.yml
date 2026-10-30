@@ -1,0 +1,65 @@
+# Open Notebook + Speaches (Kokoro TTS) for book2podcast.
+# Ollama runs on the host (see README); Open Notebook reaches it at
+# http://host.docker.internal:11434.
+#
+#   cp docker-compose.example.yml ~/open-notebook/docker-compose.yml
+#   (change OPEN_NOTEBOOK_ENCRYPTION_KEY)
+#   docker compose up -d
+#   docker compose exec speaches uv tool run speaches-cli model download speaches-ai/Kokoro-82M-v1.0-ONNX
+
+services:
+  surrealdb:
+    image: surrealdb/surrealdb:v2
+    command: start --log info --user root --pass root rocksdb:/mydata/mydatabase.db
+    user: root
+    ports:
+      - "127.0.0.1:8000:8000"    # localhost only: default credentials
+    volumes:
+      - ./surreal_data:/mydata
+    restart: always
+
+  speaches:
+    image: ghcr.io/speaches-ai/speaches:latest-cuda
+    container_name: speaches      # book2podcast restarts it by this name
+    ports:
+      - "8969:8000"
+    volumes:
+      - hf-hub-cache:/home/ubuntu/.cache/huggingface/hub
+    environment:
+      # Unload Kokoro 30 s after the last line is spoken (default 300 s), so the
+      # next chapter's LLM gets the GPU back quickly. Despite the name, this
+      # setting also governs Kokoro.
+      - WHISPER__TTL=30
+    restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+
+  open_notebook:
+    image: lfnovo/open_notebook:v1-latest
+    ports:
+      - "8502:8502"    # web UI
+      - "5055:5055"    # API used by book2podcast
+    environment:
+      - OPEN_NOTEBOOK_ENCRYPTION_KEY=change-me-to-a-secret-string
+      - SURREAL_URL=ws://surrealdb:8000/rpc
+      - SURREAL_USER=root
+      - SURREAL_PASSWORD=root
+      - SURREAL_NAMESPACE=open_notebook
+      - SURREAL_DATABASE=open_notebook
+    extra_hosts:
+      - "host.docker.internal:host-gateway"    # reach Ollama on the host
+    volumes:
+      # book2podcast reads episode progress from ./notebook_data/podcasts/episodes
+      - ./notebook_data:/app/data
+    depends_on:
+      - surrealdb
+      - speaches
+    restart: always
+
+volumes:
+  hf-hub-cache:

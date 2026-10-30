@@ -1,0 +1,1613 @@
+#!/usr/bin/env python3
+"""book2podcast - fetch a book from Calibre-Web, split it into chapters, and
+generate one Open Notebook podcast episode per chapter.
+
+  book2podcast "Thinking, Fast and Slow"              every chapter, saved to ~/Podcasts
+  book2podcast "Thinking, Fast and Slow" --list       just show the chapters
+  book2podcast "Thinking, Fast and Slow" --chapters 3-7
+  book2podcast --file ./book.pdf
+
+Re-running a command resumes: finished episodes are skipped (and downloaded if
+missing from the folder).
+
+Chapter detection: candidate breaks come from the EPUB's table of contents,
+spine files and headings; a local LLM then judges each candidate (real chapter,
+subsection, part title, front/back matter) and titles it. Books with almost no
+structure fall back to asking the LLM where chapters change in sliding windows.
+
+PDFs (used when Calibre-Web has no EPUB) first go through Docling on the GPU,
+with Ollama and Kokoro unloaded: its layout model recovers headings and drops
+page headers/footers, and the PDF's bookmarks act as the table of contents.
+Docling exits before the LLM loads, so they never share the GPU.
+
+Work is cached in ~/.cache/book2podcast/<book>/ - edit chapters.json there to
+fix a split by hand; it is reused on the next run unless --resplit is given.
+"""
+
+import argparse
+import base64
+import getpass
+import html
+import json
+import os
+import posixpath
+import re
+import shutil
+import sys
+import time
+import unicodedata
+import urllib.error
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+import zipfile
+from html.parser import HTMLParser
+from pathlib import Path
+
+CONFIG_DIR = Path.home() / ".config" / "book2podcast"
+
+
+def setting(env, key, default):
+    """Environment variable, else ~/.config/book2podcast/config.json, else default."""
+    if os.environ.get(env):
+        return os.environ[env]
+    try:
+        return json.loads((CONFIG_DIR / "config.json").read_text()).get(key) or default
+    except (OSError, ValueError):
+        return default
+
+
+CALIBRE_URL = setting("CALIBRE_URL", "calibre_url", "http://localhost:8083")
+NOTEBOOK_API = setting("OPEN_NOTEBOOK_API", "open_notebook_api", "http://localhost:5055/api")
+OLLAMA_URL = setting("OLLAMA_URL", "ollama_url", "http://localhost:11434")
+SPEACHES_URL = setting("SPEACHES_URL", "speaches_url", "http://localhost:8969")
+SPLIT_MODEL = setting("BOOK2PODCAST_SPLIT_MODEL", "split_model", "gemma4-abliterated-e4b-text:latest")
+CRED_FILE = CONFIG_DIR / "calibre.json"
+CACHE_DIR = Path.home() / ".cache" / "book2podcast"
+DOCLING_DIR = Path.home() / ".local" / "share" / "book2podcast"
+DOCLING_PYTHON = DOCLING_DIR / "docling-venv" / "bin" / "python"
+PDF_HELPER = DOCLING_DIR / "pdf_blocks.py"
+
+MIN_CHAPTER_WORDS = 400
+SUMMARY_INPUT_CHARS = 60_000
+
+
+VERBOSE = False            # -v: print every decision as it is made
+TTY = sys.stderr.isatty()
+_status = {"shown": False, "last": 0.0}
+
+
+def log(*a):
+    if _status["shown"]:      # clear the live status line first
+        print("\r\033[K", end="", file=sys.stderr)
+        _status["shown"] = False
+    print(*a, file=sys.stderr, flush=True)
+
+
+def vlog(*a):
+    if VERBOSE:
+        log(*a)
+
+
+def status(msg, force=False):
+    """A live progress line: rewritten in place on a terminal; in a log file
+    (no terminal) printed at most every 30 s so the log stays readable."""
+    if TTY:
+        print("\r\033[K" + msg[:shutil.get_terminal_size((120, 20)).columns - 1], end="", file=sys.stderr, flush=True)
+        _status["shown"] = True
+    elif force or time.time() - _status["last"] >= 30:
+        print(msg, file=sys.stderr, flush=True)
+        _status["last"] = time.time()
+
+
+def clock(seconds):
+    seconds = int(seconds)
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60:02d} s"
+    return f"{seconds // 3600} h {seconds % 3600 // 60:02d} min"
+
+
+class Progress:
+    """n of total, with elapsed time and an estimate of the time left."""
+
+    def __init__(self, label, total):
+        self.label, self.total, self.start = label, total, time.time()
+
+    def step(self, done, note=""):
+        spent = time.time() - self.start
+        left = f" · ~{clock(spent / done * (self.total - done))} left" if 0 < done < self.total else ""
+        pct = f" ({100 * done // self.total}%)" if self.total else ""
+        status(f"  {self.label} {done}/{self.total}{pct} · {clock(spent)}{left}{'  ' + note if note else ''}",
+               force=done >= self.total)
+
+    def done(self, note=""):
+        log(f"  {self.label}: {self.total} in {clock(time.time() - self.start)}{'  ' + note if note else ''}")
+
+
+# ---------------------------------------------------------------- HTTP helpers
+
+def http(method, url, body=None, headers=None, timeout=120, raw=False, to_file=None):
+    """JSON (or raw bytes) from a service. Connection drops, timeouts and 5xx
+    answers (Ollama restarting, a model reloading) are retried with backoff
+    instead of killing a run that may be hours in. to_file streams the body to
+    disk rather than holding a whole book in memory."""
+    headers = dict(headers or {})
+    data = None
+    if body is not None:
+        data = json.dumps(body).encode()
+        headers["Content-Type"] = "application/json"
+    # only reads and LLM calls are safe to repeat: re-sending "generate podcast"
+    # after a timeout could start a duplicate job
+    tries = 4 if method == "GET" or url.startswith(OLLAMA_URL) else 1
+    for attempt in range(tries):
+        try:
+            req = urllib.request.Request(url, data=data, method=method, headers=headers)
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                if to_file:
+                    tmp = Path(str(to_file) + ".part")
+                    with open(tmp, "wb") as f:
+                        shutil.copyfileobj(r, f, 1 << 20)
+                    os.replace(tmp, to_file)
+                    return None
+                payload = r.read()
+            return payload if raw else json.loads(payload or b"null")
+        except urllib.error.HTTPError as e:
+            if e.code < 500 or attempt == tries - 1:
+                raise
+            err = e
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            if attempt == tries - 1:
+                raise
+            err = e
+        wait = 10 * 3 ** attempt
+        log(f"  ({urllib.parse.urlsplit(url).netloc}: {err}; retrying in {wait} s)")
+        time.sleep(wait)
+
+
+# ------------------------------------------------------------ Calibre-Web/OPDS
+
+def basic_auth(user, password):
+    return {"Authorization": "Basic " + base64.b64encode(f"{user}:{password}".encode()).decode()}
+
+
+def check_login(user, password):
+    try:
+        http("GET", CALIBRE_URL + "/opds", headers=basic_auth(user, password), raw=True, timeout=20)
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            return False
+        raise
+
+
+def calibre_credentials():
+    """Env vars, then the saved file, then ask. Offers to save what was typed."""
+    user, password = os.environ.get("CALIBRE_USER"), os.environ.get("CALIBRE_PASS")
+    if user and password:
+        return user, password
+    if CRED_FILE.exists():
+        saved = json.loads(CRED_FILE.read_text())
+        if check_login(saved["user"], saved["password"]):
+            return saved["user"], saved["password"]
+        log(f"Saved Calibre-Web login in {CRED_FILE} was rejected.")
+    if not sys.stdin.isatty():
+        sys.exit("Calibre-Web credentials needed: run interactively, or set CALIBRE_USER and CALIBRE_PASS.")
+    log(f"Calibre-Web login for {CALIBRE_URL}")
+    for _ in range(3):
+        user = input("  Username: ").strip()
+        password = getpass.getpass("  Password: ")
+        if check_login(user, password):
+            break
+        log("  Login rejected, try again.")
+    else:
+        sys.exit("Could not log in to Calibre-Web.")
+    if input(f"  Save these credentials to {CRED_FILE} (readable only by you)? [y/N] ").strip().lower() == "y":
+        CRED_FILE.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(CRED_FILE, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as f:
+            json.dump({"user": user, "password": password}, f)
+    return user, password
+
+
+ATOM = "{http://www.w3.org/2005/Atom}"
+
+
+def opds_search(query, auth):
+    url = CALIBRE_URL + "/opds/search/" + urllib.parse.quote(query)
+    feed = ET.fromstring(http("GET", url, headers=auth, raw=True))
+    books = []
+    for entry in feed.iter(ATOM + "entry"):
+        links = {l.get("type"): l.get("href") for l in entry.iter(ATOM + "link")
+                 if "acquisition" in (l.get("rel") or "")}
+        # EPUB keeps the book's real structure; PDF only when there is nothing better
+        fmt, href = next(((f, links[t]) for f, t in (("epub", "application/epub+zip"), ("pdf", "application/pdf"))
+                          if links.get(t)), (None, None))
+        books.append({
+            "title": (entry.findtext(ATOM + "title") or "").strip(),
+            "author": ", ".join(a.findtext(ATOM + "name") or "" for a in entry.iter(ATOM + "author")),
+            "format": fmt,
+            "url": urllib.parse.urljoin(CALIBRE_URL + "/", href) if href else None,
+        })
+    return books
+
+
+def fetch_book(query):
+    auth = basic_auth(*calibre_credentials())
+    books = opds_search(query, auth)
+    if not books:
+        sys.exit(f'No books in Calibre-Web match "{query}".')
+    exact = [b for b in books if b["title"].casefold() == query.strip().casefold()]
+    if len(exact) == 1:
+        books = exact
+    if len(books) > 1:
+        for i, b in enumerate(books, 1):
+            log(f"  {i}. {b['title']} - {b['author']}  ({b['format'].upper() if b['format'] else 'no EPUB or PDF'})")
+        if not sys.stdin.isatty():
+            sys.exit("Several books match; make the title more specific.")
+        pick = input("Which book? [1] ").strip() or "1"
+        book = books[int(pick) - 1]
+    else:
+        book = books[0]
+    if not book["url"]:
+        sys.exit(f"\"{book['title']}\" has no EPUB or PDF format in Calibre-Web.")
+    workdir = CACHE_DIR / slug(book["title"])
+    workdir.mkdir(parents=True, exist_ok=True)
+    path = workdir / f"book.{book['format']}"
+    if not path.exists():
+        log(f"Downloading \"{book['title']}\" ({book['format'].upper()})...")
+        http("GET", book["url"], headers=auth, timeout=300, to_file=path)
+    return path, workdir, {"title": book["title"], "author": book["author"]}
+
+
+def slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")[:80] or "book"
+
+
+# ------------------------------------------------------------------ EPUB parse
+
+BLOCK_TAGS = {"p", "div", "li", "blockquote", "h1", "h2", "h3", "h4", "h5", "h6", "pre", "td", "dd", "dt"}
+HEADINGS = {"h1": 1, "h2": 2, "h3": 3}
+
+
+class BlockParser(HTMLParser):
+    """Turns an XHTML file into text blocks, remembering heading level and anchors."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.blocks, self.buf, self.anchors = [], [], []
+        self.level, self.skip = 0, 0
+
+    def flush(self):
+        text = re.sub(r"\s+", " ", "".join(self.buf)).strip()
+        if text:
+            self.blocks.append({"text": text, "level": self.level, "anchors": self.anchors})
+            self.anchors = []
+        self.buf, self.level = [], 0
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip += 1
+        a = dict(attrs)
+        if a.get("id"):
+            self.anchors.append(a["id"])
+        if tag in BLOCK_TAGS or tag == "br":
+            if tag != "br":
+                self.flush()
+            if tag in HEADINGS:
+                self.level = HEADINGS[tag]
+
+    def handle_endtag(self, tag):
+        if tag in ("script", "style"):
+            self.skip -= 1
+        elif tag in BLOCK_TAGS:
+            self.flush()
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.buf.append(data)
+
+
+def read_epub(path):
+    z = zipfile.ZipFile(path)
+    container = ET.fromstring(z.read("META-INF/container.xml"))
+    opf_path = next(e.get("full-path") for e in container.iter() if e.tag.endswith("rootfile"))
+    opf = ET.fromstring(z.read(opf_path))
+    base = posixpath.dirname(opf_path)
+    resolve = lambda href: posixpath.normpath(posixpath.join(base, urllib.parse.unquote(href)))
+
+    meta = {"title": "", "author": ""}
+    for e in opf.iter():
+        if e.tag.endswith("}title") and not meta["title"]:
+            meta["title"] = (e.text or "").strip()
+        if e.tag.endswith("}creator") and not meta["author"]:
+            meta["author"] = (e.text or "").strip()
+
+    manifest = {i.get("id"): i for i in opf.iter() if i.tag.endswith("}item")}
+    spine = [resolve(manifest[r.get("idref")].get("href"))
+             for r in opf.iter() if r.tag.endswith("}itemref") and r.get("idref") in manifest]
+
+    # table of contents: EPUB3 nav document, else EPUB2 NCX
+    toc = []
+    nav = next((i for i in manifest.values() if "nav" in (i.get("properties") or "").split()), None)
+    ncx = next((i for i in manifest.values() if i.get("media-type") == "application/x-dtbncx+xml"), None)
+    if nav is not None:
+        nav_path = resolve(nav.get("href"))
+        p = TocLinkParser()
+        p.feed(z.read(nav_path).decode("utf-8", "replace"))
+        nav_base = posixpath.dirname(nav_path)
+        toc = [(posixpath.normpath(posixpath.join(nav_base, urllib.parse.unquote(h))), t, d) for h, t, d in p.links]
+    if not toc and ncx is not None:   # no nav, or an empty one (Cyclonopedia): the NCX
+        ncx_path = resolve(ncx.get("href"))
+        ncx_base = posixpath.dirname(ncx_path)
+
+        def walk(node, depth):
+            for point in node:
+                if point.tag.endswith("navPoint"):
+                    label = next((e.text for e in point.iter() if e.tag.endswith("text")), "") or ""
+                    src = next((e.get("src") for e in point if e.tag.endswith("content")), None)
+                    if src:
+                        toc.append((posixpath.normpath(posixpath.join(ncx_base, urllib.parse.unquote(src))),
+                                    label.strip(), depth))
+                    walk(point, depth + 1)
+                elif point.tag.endswith("navMap"):
+                    walk(point, depth)
+        walk(ET.fromstring(z.read(ncx_path)), 0)
+    # same shape as PDF bookmarks: (href, title, depth, under_chapter, source)
+    marks = nest([{"title": t, "level": d} for _, t, d in toc])
+    toc = [(h, t, d, m["under_chapter"], "table of contents") for (h, t, d), m in zip(toc, marks)]
+
+    blocks = []
+    for file in spine:
+        try:
+            raw = z.read(file).decode("utf-8", "replace")
+        except KeyError:
+            continue
+        p = BlockParser()
+        p.feed(raw)
+        p.flush()
+        for i, b in enumerate(p.blocks):
+            b["file"], b["file_start"] = file, i == 0
+            blocks.append(b)
+    return meta, blocks, toc
+
+
+class TocLinkParser(HTMLParser):
+    """Links of the nav document's toc, with their nesting depth (Part > Chapter > section)."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.links, self.href, self.text, self.in_toc, self.depth = [], None, [], False, 0
+
+    def handle_starttag(self, tag, attrs):
+        a = dict(attrs)
+        if tag == "nav" and "toc" in (a.get("epub:type") or a.get("role") or "toc"):
+            self.in_toc = True
+        if tag in ("ol", "ul") and self.in_toc:
+            self.depth += 1
+        if tag == "a" and self.in_toc:
+            self.href, self.text = a.get("href"), []
+
+    def handle_endtag(self, tag):
+        if tag == "a" and self.href:
+            self.links.append((self.href, " ".join("".join(self.text).split()), max(self.depth - 1, 0)))
+            self.href = None
+        if tag in ("ol", "ul") and self.in_toc:
+            self.depth -= 1
+        if tag == "nav":
+            self.in_toc = False
+
+    def handle_data(self, data):
+        if self.href:
+            self.text.append(data)
+
+
+# ------------------------------------------------------------------- PDF parse
+
+def read_pdf(path, workdir):
+    """Docling (own venv, on the GPU) turns the PDF into blocks shaped like the EPUB
+    ones; PDF bookmarks stand in for the table of contents."""
+    import subprocess
+    cache = workdir / "pdf_blocks.json"
+    if not cache.exists():
+        if not DOCLING_PYTHON.exists():
+            sys.exit(f"PDF support needs Docling: expected a venv at {DOCLING_PYTHON.parent.parent}")
+        log("Freeing the GPU for Docling...")
+        free_gpu(everything=True)
+        started = time.time()
+        r = subprocess.run([str(DOCLING_PYTHON), "-I", str(PDF_HELPER), str(path), str(cache) + ".tmp"])
+        if r.returncode in (-9, 137):
+            sys.exit(f"Docling was killed while reading {path}, most likely for running out of memory. "
+                     "Close other programs and run the same command again.")
+        if r.returncode != 0:
+            sys.exit(f"Docling failed on {path} (exit {r.returncode}).")
+        os.replace(str(cache) + ".tmp", cache)
+        log(f"Docling finished in {int(time.time() - started) // 60} min {int(time.time() - started) % 60} s")
+    d = json.loads(cache.read_text())
+
+    # Safety net for running headers Docling missed: short lines repeated on several
+    # pages. A page number glued to a header is ignored, but "Chapter 1" and
+    # "Chapter 2" must stay distinct, so numbers only go when the rest is long.
+    norm = lambda t: re.sub(r"\W+", " ", t.lower()).strip()
+
+    def header_key(t):
+        k = norm(t)
+        bare = re.sub(r"^\d+ | \d+$", "", k).strip()
+        return bare if len(bare) > 12 else k
+
+    # Lines in the top/bottom margin are judged by their words alone (page numbers
+    # dropped): two pages with the same margin words make it a running header.
+    letters = lambda t: re.sub(r"[^a-z]+", " ", t.lower()).strip()
+    in_margin = lambda b: b.get("top", 0.5) < 0.08 or b.get("bottom", 0.5) > 0.94
+    seen, margin = {}, {}
+    for b in d["blocks"]:
+        if len(b["text"]) < 80:
+            seen.setdefault(header_key(b["text"]), set()).add(b["page"])
+            if in_margin(b):
+                margin.setdefault(letters(b["text"]), set()).add(b["page"])
+    repeated = {k for k, p in seen.items() if k and len(p) >= max(3, d["pages"] // 40)}
+    margin_rep = {k for k, p in margin.items() if len(k) > 3 and len(p) >= 2
+                  and not re.fullmatch(r"(chapter|part|book|letter|section)( [ivxlc]+)?", k)}
+    # ("Contents" repeated atop each contents page is the heading the contents
+    # rebuild needs, not a running header)
+    is_header = lambda b: (len(b["text"]) < 80 and not CONTENTS_HEADING.fullmatch(b["text"].strip(" .:").casefold())
+                           and (header_key(b["text"]) in repeated
+                                or (in_margin(b) and letters(b["text"]) in margin_rep)))
+    # Docling's heading levels come from font size; on a scan that is the height of
+    # OCR boxes ("FIFTH MEDITATION" came out deepest), so scans keep headings flat.
+    flat = d.get("scanned")
+    blocks = [{"text": b["text"], "level": min(b["level"], 1) if flat else b["level"], "page": b["page"],
+               "anchors": [], "file": "pdf", "file_start": False}
+              for b in d["blocks"] if not is_header(b)]
+
+    # Bookmarks that are all alike ("a_Sayfa_003_1L", "Page 4") are scanner junk.
+    marks = d["toc"]
+    if marks and len({letters_only(bm["title"]) for bm in marks}) <= max(3, len(marks) // 10):
+        log(f"  ignoring {len(marks)} bookmarks that are just page labels")
+        marks = []
+    # Bookmarks that cover the book are its table of contents: Docling's headings
+    # (sections, figure titles, running heads) would only add noise next to them.
+    if len(marks) >= 5 and max(bm["page"] for bm in marks) - min(bm["page"] for bm in marks) >= 0.6 * d["pages"]:
+        for b in blocks:
+            b["level"] = 0
+    elif not marks:
+        marks = printed_contents(blocks)
+    marks = nest(marks)
+
+    # A bookmark points at a page: anchor it on the block there that carries its title.
+    toc = []
+    for k, bm in enumerate(marks):
+        on_page = [i for i, b in enumerate(blocks) if b["page"] == bm["page"]]
+        if not on_page:
+            continue
+        want = norm(bm["title"])
+        matches = lambda t: want and (t.startswith(want) or (len(t) >= 4 and want.startswith(t)))
+        i = next((i for i in on_page if matches(norm(blocks[i]["text"]))), on_page[0])
+        blocks[i]["anchors"].append(f"bm{k}")
+        toc.append((f"pdf#bm{k}", bm["title"], bm["level"], bm["under_chapter"], bm.get("source")))
+    return d["meta"], blocks, toc
+
+
+def nest(marks):
+    """A contents entry nested under anything but a part ("INTRODUCTION" > "The Lay
+    of the Land", "Foreword" > "Notes") is a section of it."""
+    # one root entry wrapping the whole book (its title) is not a parent chapter
+    top = min((bm["level"] for bm in marks), default=0)
+    root = [bm for bm in marks if bm["level"] == top]
+    wrapper = root[0] if len(root) == 1 and len(marks) > 3 else None
+    for n, bm in enumerate(marks):
+        parent = next((p for p in reversed(marks[:n]) if p["level"] < bm["level"]), None)
+        bm["under_chapter"] = bool(parent) and parent is not wrapper and not PART_TITLE.match(parent["title"])
+    return marks
+
+
+PART_TITLE = re.compile(r"(part|book|volume|kısım|teil|partie)\b|[ivxlc]+\.?\s*$", re.I)
+
+
+def printed_contents(blocks):
+    """Bookmarks rebuilt from the printed contents page ("Facing Plato's Problem 51"),
+    for PDFs without real ones. Printed page numbers are mapped to PDF pages by
+    the offset that the most entries agree on, found from entries whose titles
+    do appear in the text. Chapters whose heading OCR lost come back this way."""
+    start = next((i for i, b in enumerate(blocks[:len(blocks) // 5])
+                  if len(b["text"]) < 40 and CONTENTS_HEADING.fullmatch(b["text"].strip(" .:").casefold())), None)
+    if start is None:
+        return []
+    entries, pending, end = [], [], start + 1
+    for end in range(start + 1, min(len(blocks), start + 250)):
+        t = blocks[end]["text"]
+        if len(t.split()) > 40:
+            break
+        m = re.fullmatch(r"(.*?)[\s.·…]*\b(\d{1,4}|[ivxlc]{1,7})", t, re.I)
+        if m and re.fullmatch(r"(chapter|part|book|kısım|bölüm)", m.group(1).strip(" ."), re.I):
+            pending = [t]            # "Chapter 3" on its own line: the title follows
+        elif m:
+            title = " ".join(pending + [m.group(1)]).strip(" .")
+            pending = []
+            if title and m.group(2).isdigit():
+                entries.append({"title": title, "printed": int(m.group(2))})
+        elif not re.match(r"(by|chap\.?|page|sayfa)\b", t, re.I):
+            pending = (pending + [t])[-3:]
+    # A contents page runs forward through the book: keep the longest run of
+    # increasing page numbers, dropping misread lines (chapter numbers, OCR junk).
+    runs = []
+    for e in entries:
+        prev = max((r for r in runs if r[-1]["printed"] <= e["printed"]), key=len, default=[])
+        runs.append(prev + [e])
+    entries = max(runs, key=len, default=[])
+    if len(entries) < 3:
+        return []
+    # every place a title appears votes for an offset (an overview or preface may
+    # name all the chapters first); the true offset is the one most entries share
+    offsets = {}
+    for e in entries:
+        want = letters_only(e["title"])[:30]
+        if len(want) < 8:
+            continue
+        for off in {b["page"] - e["printed"] for b in blocks[end:] if letters_only(b["text"]).startswith(want)}:
+            offsets[off] = offsets.get(off, 0) + 1
+    best = max(offsets.items(), key=lambda kv: kv[1], default=(None, 0))
+    if best[1] < 2:
+        return []
+    log(f"  rebuilt {len(entries)} contents entries from the printed contents page (page offset {best[0]})")
+    return [{"title": e["title"], "page": e["printed"] + best[0], "level": 0, "source": "contents page"}
+            for e in entries]
+
+
+# ------------------------------------------------------------------ LLM helper
+
+def llm_json(prompt, model=SPLIT_MODEL):
+    body = {"model": model, "stream": False, "format": "json", "think": False,
+            "options": {"temperature": 0.1},
+            "messages": [{"role": "user", "content": prompt}]}
+    for attempt in range(3):
+        try:
+            r = http("POST", OLLAMA_URL + "/api/chat", body, timeout=600)
+            text = re.sub(r"<think>.*?</think>", "", r["message"]["content"], flags=re.S)
+            return json.loads(text[text.find("{"): text.rfind("}") + 1])
+        except urllib.error.HTTPError as e:
+            if e.code == 400 and "think" in body:   # model without a thinking switch
+                body.pop("think")
+                continue
+            if attempt == 2:
+                raise
+        except (ValueError, KeyError):
+            if attempt == 2:
+                return {}
+    return {}
+
+
+def llm_text(prompt, model=SPLIT_MODEL):
+    body = {"model": model, "stream": False, "think": False, "options": {"temperature": 0.3},
+            "messages": [{"role": "user", "content": prompt}]}
+    try:
+        r = http("POST", OLLAMA_URL + "/api/chat", body, timeout=900)
+    except urllib.error.HTTPError as e:
+        if e.code != 400:
+            raise
+        body.pop("think")
+        r = http("POST", OLLAMA_URL + "/api/chat", body, timeout=900)
+    return re.sub(r"<think>.*?</think>", "", r["message"]["content"], flags=re.S).strip()
+
+
+# ----------------------------------------------------------- chapter detection
+
+def candidates(blocks, toc):
+    """Indices of blocks where a chapter might start, with a title hint."""
+    by_anchor = {}
+    for i, b in enumerate(blocks):
+        for a in b["anchors"]:
+            by_anchor.setdefault((b["file"], a), i)
+        if b["file_start"]:
+            by_anchor.setdefault((b["file"], None), i)
+    cand = {}
+    # with real bookmarks or a nested EPUB toc, "Part 2: Consider the following
+    # data" lines in exercises are noise, not chapter headings
+    real_toc = sum(1 for t in toc if len(t) > 2 and t[4] != "contents page") >= 5
+    for href, title, *extra in toc:   # depth, under_chapter, source
+        file, _, frag = href.partition("#")
+        i = by_anchor.get((file, frag or None), by_anchor.get((file, None)))
+        if i is not None and i not in cand:
+            cand[i] = {"title": title, "source": "toc"}
+            if extra:
+                depth, under_chapter, src = extra
+                cand[i].update(depth=depth, under_chapter=under_chapter,
+                               source=src or f"bookmark at outline level {depth + 1}")
+    for i, b in enumerate(blocks):
+        if i in cand:
+            # a contents entry landed on this heading: keep the heading's words too
+            # ("2. Distributional Structure / DISTRIBUTIONAL STRUCTURE Z. HARRIS")
+            if 1 <= b["level"] <= 6 and letters_only(b["text"])[:20] not in letters_only(cand[i]["title"]):
+                cand[i]["title"] = f"{cand[i]['title']} / {b['text'][:120]}"
+            continue
+        # PDF heading levels (Docling's hierarchy stage) are only a hint shown to
+        # the judge: a wrong level must not make a chapter heading invisible.
+        top = 6 if b["file"] == "pdf" else 2
+        if 1 <= b["level"] <= top or (b["file_start"] and len(b["text"]) < 120):
+            cand[i] = {"title": b["text"][:120], "source": f"heading level {b['level']}" if b["level"] else "file"}
+            if b["file"] == "pdf" and b["level"]:
+                cand[i]["hdepth"] = b["level"] - 1
+        elif (not real_toc
+              and re.match(r"^(chapter|part|book)\s+([0-9ivxlc]+|[a-z]+)\b", b["text"], re.I) and len(b["text"]) < 80
+              and not re.search(r",|\bnotes?\b|\bpp?\.", b["text"], re.I)):   # not "Chapter 1, note 39"
+            cand[i] = {"title": b["text"], "source": "pattern"}
+    # Nested entries are sections only when they are section-sized: A Little Life's
+    # chapters sit under its Parts too, but run 5,000-38,000 words.
+    order = sorted(cand)
+    words_to = {i: sum(len(b["text"].split()) for b in blocks[i:(order[n + 1] if n + 1 < len(order) else len(blocks))])
+                for n, i in enumerate(order)}
+    groups = {}
+    for n, i in enumerate(order):
+        if "depth" in cand[i] and cand[i]["depth"] > 0:
+            parent = next((k for k in reversed(order[:n]) if cand[k].get("depth", 99) < cand[i]["depth"]), None)
+            groups.setdefault(parent, []).append(i)
+    for kids in groups.values():
+        # upper quartile, not the mean: The Mind's I pairs each 4-8k-word piece with
+        # a 1-2k-word "Reflections", and the pieces are what matters
+        sizes = sorted(words_to[k] for k in kids)
+        if sizes[(3 * len(sizes)) // 4] >= 4000:
+            for k in kids:
+                cand[k]["big_unit"] = True
+    # A scan's rebuilt contents page is the author's chapter list: a heading it
+    # doesn't mention (and that isn't "Chapter N") is a section inside a chapter.
+    entries = [t for _, t, *x in toc if x and x[2] == "contents page"]
+    listed = [letters_only(t).split() for t in entries]
+    # A contents list whose arabic numbering starts over ("IV. Analogy", "1. Definition",
+    # "2. ...", then "V. ...", "1. ...") numbers sections under its chapters. Katz's
+    # essays run 1-11 once, so there the numbers are the chapters.
+    leading = [m.group(1) for m in (re.match(r"(\d+)\.?\s+\D", t) for t in entries) if m]
+    if leading and max(leading.count(n) for n in set(leading)) >= 2:   # a number used twice
+        for c in cand.values():
+            if c["source"] == "contents page" and re.match(r"\d+\.?\s+\D", c["title"]):
+                c["numbered_section"] = True
+    if len(listed) >= 5 and sum(bool(ITEM.search(t)) for t in entries) < len(entries) * 0.3:   # not a § list
+        if len(entries) <= 40:   # a short list is the chapter list itself: its entries are chapters
+            for c in cand.values():
+                if c["source"] == "contents page":
+                    c["chapter_list"] = True
+        for c in cand.values():
+            if c["source"].startswith("heading") and not MAJOR_UNIT.search(c["title"]):
+                words = set(letters_only(c["title"]).split())
+                # most of the heading and most of the entry: "STIMULUS CONTROL" is not
+                # "Special Conditions Affecting Stimulus Control"
+                if words and not any(len(words & set(e)) >= 0.6 * min(len(words), len(set(e)))
+                                     and len(words & set(e)) >= 0.5 * len(set(e)) for e in listed if e):
+                    c["unlisted"] = True
+    titles = {letters_only(c["title"]) for c in cand.values()}
+    for i, c in cand.items():
+        if looks_like_contents(blocks[i:i + 16], titles - {letters_only(c["title"])}):
+            c["contents"] = True
+    # The list's last lines see too few titles ahead of them. An entry still
+    # counts if it follows the list with no prose between and its chapter heading
+    # comes later; the real first heading only matches an entry before it.
+    order, prev = sorted(cand), None
+    for n, i in enumerate(order):
+        c, t = cand[i], letters_only(cand[i]["title"])
+        if (prev is not None and cand[prev].get("contents") and not c.get("contents")
+                and len(t.split()) >= 3 and all(len(b["text"].split()) <= 40 for b in blocks[prev:i])
+                and any(letters_only(cand[k]["title"]) == t for k in order[n + 1:])):
+            c["contents"] = True
+        prev = i
+    # Breaks with almost no text between them (a TOC entry followed by its own
+    # heading) collapse into the first one, keeping every title as a hint. A
+    # contents page never absorbs what follows: that would swallow chapter one.
+    merged, last = {}, None
+    for i in sorted(cand):
+        if (last is not None and not merged[last].get("contents")
+                and sum(len(b["text"].split()) for b in blocks[last:i]) < 60):
+            m, c = merged[last], cand[i]
+            if letters_only(c["title"]) not in letters_only(m["title"]):
+                m["title"] = f"{m['title']} / {c['title']}"
+            if c["source"] == "toc" or "depth" in c:
+                m["source"] = c["source"]
+                if "depth" in c:
+                    m["depth"] = min(m.get("depth", 99), c["depth"])
+            continue
+        merged[i], last = dict(cand[i]), i
+    return merged
+
+
+def letters_only(text):
+    return re.sub(r"[^a-z]+", " ", text.lower()).strip()
+
+
+def looks_like_contents(window, other_titles=()):
+    """A contents page lists other chapters' titles, or many bare page numbers;
+    chapter text does neither. Small models miss it under a running header."""
+    lines = []
+    for b in window:   # only the list part: a contents page has no prose
+        if len(b["text"].split()) > 40:
+            break
+        lines.append(b)
+    bare = sum(bool(re.fullmatch(r"\d{1,4}", b["text"])) for b in lines)
+    if bare >= 4 and bare >= len(lines) // 4:
+        return True
+    listed = 0
+    for b in lines:
+        t = letters_only(b["text"])
+        if len(t) >= 4 and any(t == o or (min(len(t), len(o)) >= 8 and (t.startswith(o) or o.startswith(t)))
+                               for o in other_titles if o):
+            listed += 1
+    return listed >= 4
+
+
+CONTENTS_PART = """The book's own contents page (may contain OCR errors):
+<<<
+{contents}
+>>>
+The contents page is the author's list of chapters. A break whose title is a top-level entry there
+is most likely a chapter; one listed indented or numbered under another entry is a section of that
+entry ("subsection"); a part heading that groups entries is a "part". A title that does not appear
+in the contents at all is often just a heading inside a chapter.
+
+"""
+
+JUDGE_PROMPT = """You are helping split the book "{book}" into chapters for a podcast series.
+A possible section break was found. Title hint: "{title}" (found via {source}).
+
+{contents}All possible breaks near this one, in book order (>> marks this one):
+{outline}
+Use the outline for structure: an untitled number (e.g. "II.") between titled chapters is
+usually a section inside the titled chapter before it, unless every chapter is numbered that way.
+
+Text just BEFORE the break:
+<<<
+{before}
+>>>
+
+Text just AFTER the break:
+<<<
+{after}
+>>>
+
+A list of chapter titles with page numbers is a contents page ("front_matter"), even when it
+continues from an earlier page or sits under an author name or running header.
+
+Classify what starts AFTER the break. Answer with JSON only:
+{{"kind": one of "chapter" (a main chapter, prologue, introduction or epilogue with real content),
+          "part" (a part/book divider page that just groups chapters),
+          "subsection" (a heading inside a chapter, the same chapter continues),
+          "front_matter" (cover, title page, copyright, dedication, contents, epigraph, foreword about the edition),
+          "back_matter" (acknowledgements, notes, bibliography, index, about the author, appendix of references),
+ "title": a clean human-readable chapter title in the book's own language (never translate it),
+          e.g. "Chapter 3: The Lazy Controller",
+ "reason": a few words}}"""
+
+
+CONTENTS_HEADING = re.compile(r"(table of )?contents|i̇?çi̇?ndeki̇?ler|inhalt|sommaire|índice|indice", re.I)
+
+
+def contents_text(blocks, cand, limit=4000):
+    """The book's printed contents page(s): the author's own list of chapters and
+    how sections nest under them. Taken from breaks flagged as contents, else
+    from the short lines after a "Contents" heading."""
+    keys = sorted(cand)
+    spans = [(i, keys[n + 1] if n + 1 < len(keys) else len(blocks)) for n, i in enumerate(keys)
+             if cand[i].get("contents")]
+    spans += [(i, len(blocks)) for i, b in enumerate(blocks)
+              if len(b["text"]) < 40 and CONTENTS_HEADING.fullmatch(b["text"].strip(" .:").casefold())][:2]
+    lines, used = [], set()
+    for start, end in sorted(spans):
+        for k in range(start, min(end, start + 150)):
+            if len(blocks[k]["text"].split()) > 40:   # prose: the list is over
+                break
+            if k not in used:
+                used.add(k)
+                lines.append(blocks[k]["text"])
+    return "\n".join(lines)[:limit]
+
+
+def outline(cand, current, radius=25):
+    """Nearby break titles, so the judge sees e.g. that an untitled "II." sits under
+    "I. A Scandal in Bohemia" and before "II. The Red-Headed League"."""
+    keys = list(cand)
+    at = keys.index(current)
+    lines = [f"{'>>' if k == current else '  '} {'    ' * cand[k].get('depth', cand[k].get('hdepth', 0))}"
+             f"{cand[k]['title'][:70]}"
+             for k in keys[max(0, at - radius):at + radius + 1]]
+    return "\n".join(lines)
+
+
+NUMERAL = r"(?:chapter|part|book|section)?\s*([ivxlc]+|\d+)"
+
+
+def section_numbers(cand):
+    """Numbers that title real chapters ("II. The Red-Headed League"). A bare "II."
+    elsewhere then belongs to a sub-numbering inside a chapter."""
+    nums = set()
+    for c in cand.values():
+        m = re.match(NUMERAL + r"[.:]?\s+[a-z][a-z ]{3,}", letters_or_digits(c["title"]))
+        if m:
+            nums.add(m.group(1))
+    return nums
+
+
+def letters_or_digits(text):
+    return re.sub(r"[^a-z0-9.:]+", " ", text.lower()).strip()
+
+
+MAJOR_UNIT = re.compile(r"\b(chapter|part|book|introduction|conclusion|preface|foreword|prologue|epilogue"
+                        r"|meditation|appendix|lecture|essay|giriş|bölüm|kısım|sonuç|önsöz)\b", re.I)
+ITEM = re.compile(r"\d+\.\d+"                                   # 3.1 Element
+                  r"|\("                                        # (5) example sentence, (∀U) formula
+                  r"|§"                                         # § 37. Time as the universal form
+                  r"|(observation|example|figure|fig|table|theorem|lemma|definition|proof|corollary"
+                  r"|exercise|note)\s*\d", re.I)
+FRAGMENT = re.compile(r"[a-z].*\b(the|a|an)$")   # titles end in "For" or "Of", never in "the"
+NUMBERED = re.compile(r"(\d+)\.?\s+[^\d\s]")
+
+
+def structural_sections(cand):
+    """Breaks that can't be chapters by their shape: decimal or bracketed numbers,
+    labelled items, sentence fragments, and essay sections ("2. ...") in books
+    whose numbering restarts under each essay or chapter title."""
+    found = {}
+    # Only when numbering starts over (each essay its own "1."): a book whose
+    # chapters are "1. ...", "2. ..." uses every number once.
+    ones = sum(any(NUMBERED.match(p) and NUMBERED.match(p).group(1) == "1" for p in c["title"].split(" / "))
+               for c in cand.values() if not c.get("contents"))
+    restarts = ones >= 2
+    # In a bookmark tree three or more levels deep, the deepest level is sections
+    # (Part > Chapter > section).
+    deepest = max((c["depth"] for c in cand.values() if "depth" in c), default=0)
+    in_numbered, after_title = False, False
+    for i, c in cand.items():
+        if deepest >= 2 and c.get("depth") == deepest and not c.get("big_unit"):
+            found[i] = "deepest bookmark level"
+            continue
+        if c.get("under_chapter") and not c.get("big_unit"):
+            found[i] = "bookmark nested under a chapter"
+            continue
+        if c.get("unlisted"):
+            found[i] = "heading not in the printed contents"
+            continue
+        if c.get("numbered_section"):
+            found[i] = "numbered section in the printed contents"
+            continue
+        parts = [p.strip() for p in c["title"].split(" / ")]
+        first = parts[0]
+        if (ITEM.match(first) or FRAGMENT.search(first.rstrip(" .,;:"))
+                or re.fullmatch(r"[A-Z]\.?", first)):   # glossary/index letter
+            found[i] = "numbered item, formula or sentence fragment"
+            continue
+        # entries from bookmarks or a contents page are the author's chapter list
+        listed = c["source"] == "toc" or "depth" in c
+        m = NUMBERED.match(first) if restarts else None
+        if m and not listed and (in_numbered and int(m.group(1)) >= 2 or after_title and m.group(1) == "1"):
+            found[i] = "numbered section inside a chapter"
+            in_numbered = True
+            continue
+        # "TITLE / AUTHOR / 1. INTRODUCTION": numbering restarts under a real title
+        # (under "Part Two" it would be chapter numbering, so that doesn't count)
+        part_heading = re.match(r"(part|book|volume)\b", first, re.I)
+        restart = any(NUMBERED.match(p) and NUMBERED.match(p).group(1) == "1" for p in parts[1:])
+        in_numbered = restart and not part_heading and (not m or listed)
+        after_title = (not m or listed) and not part_heading and not restart
+    return found
+
+
+def judge_candidates(meta, blocks, cand):
+    judged = {}
+    titled = section_numbers(cand)
+    shapes = structural_sections(cand)
+    contents = contents_text(blocks, cand)
+    if contents:
+        log(f"  giving the judge the book's contents page ({len(contents)} characters)")
+    contents_part = CONTENTS_PART.format(contents=contents) if contents else ""
+    # the time estimate counts only the breaks that go to the model
+    asks = sum(1 for i, c in cand.items() if not c.get("contents") and i not in shapes)
+    prog, asked, chapters = Progress("judging breaks", asks), 0, 0
+
+    def verdict(n, i, how):
+        j = judged[i]
+        vlog(f"    {n:>3}/{len(cand)} {j['kind']:<12} {j['title'][:60]!r}  ({how}: {j.get('reason', '')[:70]})")
+
+    for n, (i, c) in enumerate(cand.items(), 1):
+        if c.get("contents"):
+            judged[i] = {**c, "kind": "front_matter", "reason": "lists other chapters"}
+            verdict(n, i, "rule")
+            continue
+        if i in shapes:
+            judged[i] = {**c, "kind": "subsection", "reason": shapes[i]}
+            verdict(n, i, "rule")
+            continue
+        bare = re.fullmatch(r"([ivxlc]+|\d+)\.?", letters_or_digits(c["title"]))
+        if bare and bare.group(1) in titled:
+            judged[i] = {**c, "kind": "subsection", "reason": "untitled number; titled chapters use the same numbers"}
+            verdict(n, i, "rule")
+            continue
+        before = " ".join(b["text"] for b in blocks[max(0, i - 6):i])[-800:]
+        after = " ".join(b["text"] for b in blocks[i:i + 10])[:1500]
+        prog.step(asked, f"{chapters} chapters so far · now: {c['title'][:40]}")
+        v = llm_json(JUDGE_PROMPT.format(book=meta["title"], title=c["title"], source=c["source"],
+                                         outline=outline(cand, i), contents=contents_part,
+                                         before=before or "(start of book)", after=after))
+        asked += 1
+        kind = v.get("kind") if v.get("kind") in ("chapter", "part", "subsection", "front_matter", "back_matter") else "subsection"
+        if kind == "subsection" and c.get("chapter_list"):
+            kind = "chapter"   # an entry of the book's own short chapter list is not a section
+        chapters += kind == "chapter"
+        judged[i] = {**c, "kind": kind, "title": (v.get("title") or c["title"]).strip(), "reason": v.get("reason", ""),
+                     "hint": c["title"]}
+        verdict(n, i, SPLIT_MODEL.split(":")[0])
+    prog.done(f"{len(cand) - asks} more settled by rules, {chapters} judged chapters")
+    return judged
+
+
+WINDOW_PROMPT = """Below are numbered paragraphs from the book "{book}". Does a new CHAPTER (not just a
+new scene or subsection) begin at one of them? Answer JSON only:
+{{"starts": [{{"paragraph": number, "title": "short chapter title"}}]}}  (empty list if none)
+
+{paras}"""
+
+
+def window_split(meta, blocks, size=60):
+    """Fallback for books without usable structure."""
+    judged = {0: {"title": "Opening", "source": "window", "kind": "chapter", "reason": "start"}}
+    for start in range(0, len(blocks), size - 10):
+        chunk = blocks[start:start + size]
+        log(f"  scanning paragraphs {start}-{start + len(chunk)} of {len(blocks)}")
+        paras = "\n".join(f"[{start + k}] {b['text'][:400]}" for k, b in enumerate(chunk))
+        for s in llm_json(WINDOW_PROMPT.format(book=meta["title"], paras=paras)).get("starts", []):
+            i = s.get("paragraph")
+            if isinstance(i, int) and start < i < start + len(chunk):
+                judged.setdefault(i, {"title": s.get("title", ""), "source": "window", "kind": "chapter", "reason": ""})
+    return dict(sorted(judged.items()))
+
+
+SHORT_WORK_WORDS = 20_000
+
+
+CONSOLIDATE_PROMPT = """The book "{book}" ({total} words) was split at the headings below, but that gave
+{n} pieces averaging only {avg} words: most of them must be sections inside chapters, not chapters.
+Each line: number, length in words, heading.
+
+{lines}
+
+Each chosen piece will become one podcast episode, so choose the book's chapter level: the level
+of division whose units are mostly 2,000 to 15,000 words long (a chapter, or a free-standing piece
+such as an introduction, a dialogue between chapters, an essay or an appendix). Do not pick only
+the few largest divisions (parts, periods, volumes) if they contain titled chapters; do not pick
+sections or subsections inside a chapter. Answer JSON only: {{"top_level": [numbers]}}"""
+
+
+def consolidate(meta, blocks, judged):
+    """One global look when local judging produced an implausibly fine split (GEB:
+    331 "chapters" of ~700 words): the model sees every title with its length."""
+    ch = [i for i in sorted(judged) if judged[i]["kind"] == "chapter"]
+    ends = ch[1:] + [len(blocks)]
+    words = [sum(len(b["text"].split()) for b in blocks[i:e]) for i, e in zip(ch, ends)]
+    if len(ch) <= 40 or sorted(words)[len(words) // 2] >= 1500:
+        return judged
+    # numbered chapter headings among them ("IV. Noun and Adjective Suffixes",
+    # "XI Gerunds", "Chapter 7") are the chapter level; no need to ask
+    numbered = [i for i in ch if re.match(r"(chapter\s+)?([IVXLC]{1,6}|[ivxlc]{2,6}|\d{1,2})[.:]?\s+\S",
+                                          judged[i]["title"].split(" / ")[-1])
+                and (re.match(r"chapter\s", judged[i]["title"], re.I) or not re.match(r"\d", judged[i]["title"]))]
+    if len(numbered) >= 5 and sum(words) / len(numbered) <= 25_000:
+        keep = set(numbered) | {ch[0]} | {i for i in ch if MAJOR_UNIT.search(judged[i]["title"])}
+        log(f"  {len(ch)} chapters is too fine; keeping the {len(numbered)} numbered chapter headings")
+        return {i: ({**j, "kind": "subsection", "reason": "section by the global check"}
+                    if j["kind"] == "chapter" and i not in keep else j) for i, j in judged.items()}
+    log(f"  {len(ch)} chapters of median {sorted(words)[len(words) // 2]} words is too fine; "
+        f"asking {SPLIT_MODEL} to pick the top-level ones...")
+    lines = "\n".join(f"{n}. [{w}] {judged[i]['title'][:70]}" for n, (i, w) in enumerate(zip(ch, words), 1))
+    keep = llm_json(CONSOLIDATE_PROMPT.format(book=meta["title"], total=sum(words), n=len(ch),
+                                              avg=sum(words) // len(ch), lines=lines)).get("top_level", [])
+    keep = {ch[k - 1] for k in keep if isinstance(k, int) and 1 <= k <= len(ch)}
+    # sanity: episodes averaging over 25,000 words means it picked parts/periods
+    if not 3 <= len(keep) < len(ch) * 0.8 or sum(words) / max(len(keep), 1) > 25_000:
+        log("  (the answer was not usable; keeping the fine split)")
+        return judged
+    keep.add(ch[0])
+    log(f"  kept {len(keep)} top-level chapters")
+    return {i: ({**j, "kind": "subsection", "reason": "section by the global check"}
+                if j["kind"] == "chapter" and i not in keep else j) for i, j in judged.items()}
+
+
+def detect_chapters(meta, blocks, toc):
+    cand = candidates(blocks, toc)
+    log(f"Found {len(cand)} possible chapter breaks; asking {SPLIT_MODEL} to judge them...")
+    judged = judge_candidates(meta, blocks, cand) if cand else {}
+    judged = consolidate(meta, blocks, judged)
+    if sum(j["kind"] == "chapter" for j in judged.values()) < 2:
+        if sum(len(b["text"].split()) for b in blocks) < SHORT_WORK_WORDS:
+            log("No chapter structure in a short work (an essay or article): one episode.")
+            return {0: {"title": meta["title"], "source": "whole work", "kind": "chapter", "reason": "short work"}}
+        log("Too little structure; falling back to scanning the text for chapter changes...")
+        judged = window_split(meta, blocks)
+    return judged
+
+
+def build_chapters(blocks, judged):
+    # Front matter after the first chapter, or back matter with chapters still to
+    # come, is a misjudgment; honouring it would silently drop chapters of text.
+    # Only chapters with real length count (a stray heading in the bibliography
+    # judged "chapter" must not pull the bibliography back in).
+    # A "chapter" inside the closing back matter ("Articles" between "Bibliography"
+    # and "Index") is back matter too. Only at the end of the book: References
+    # closing one essay in an anthology are followed by real chapters.
+    order = [i for i in sorted(judged) if judged[i]["kind"] != "subsection"]
+    ends = order[1:] + [len(blocks)]
+    unit_words = {i: sum(len(b["text"].split()) for b in blocks[i:e]) for i, e in zip(order, ends)}
+    judged = dict(judged)
+    # the whole run of short "chapters" after the last back matter that has no long
+    # chapter after it (notes grouped "Chapter 6 ...", index letters, "Articles")
+    long_at = [i for i in order if judged[i]["kind"] == "chapter" and unit_words[i] >= 2000]
+    tail_back = [i for i in order if judged[i]["kind"] == "back_matter" and (not long_at or i > long_at[-1])]
+    if tail_back:
+        for i in order:
+            if i > tail_back[0] and judged[i]["kind"] == "chapter":
+                judged[i] = {**judged[i], "kind": "back_matter"}
+    starts = sorted(judged) + [len(blocks)]
+    span = {i: sum(len(b["text"].split()) for b in blocks[i:starts[n + 1]]) for n, i in enumerate(starts[:-1])}
+    # A "part" break followed by real text before the next chapter-level break
+    # also starts a chapter ("PART ONE / CHAPTER 1" collapsed into one break);
+    # dropping it as a bare divider page would throw away the whole chapter.
+    major = [i for i in sorted(judged) if judged[i]["kind"] != "subsection"] + [len(blocks)]
+    unit = {i: sum(len(b["text"].split()) for b in blocks[i:major[n + 1]]) for n, i in enumerate(major[:-1])}
+    judged = {i: ({**j, "kind": "chapter", "title": j.get("hint", j["title"]).replace(" / ", " - ")}
+                  if j["kind"] == "part" and unit[i] >= MIN_CHAPTER_WORDS else j)
+              for i, j in judged.items()}
+    # "Letter 1" judged front matter while "Letter 2", "Letter 3" are chapters:
+    # a break titled like its sibling chapters is one of them
+    sibling = lambda t: re.sub(r"[\d\s.:]+|\b[ivxlc]+\b", " ", letters_or_digits(t)).strip()
+    chapter_kinds = {sibling(j.get("hint", j["title"])) for j in judged.values() if j["kind"] == "chapter"}
+    judged = {i: ({**j, "kind": "chapter"} if j["kind"] == "front_matter" and re.search(r"\d|\b[ivxlc]+\b", j["title"], re.I)
+                  and sibling(j.get("hint", j["title"])) in chapter_kinds - {""} else j)
+              for i, j in judged.items()}
+    chapter_at = [i for i, j in judged.items() if j["kind"] == "chapter" and span[i] >= MIN_CHAPTER_WORDS]
+    judged = {i: ({**j, "kind": "subsection"}
+                  if chapter_at and ((j["kind"] == "front_matter" and i > chapter_at[0])
+                                     or (j["kind"] == "back_matter" and i < chapter_at[-1])) else j)
+              for i, j in judged.items()}
+    chapters, current, pending_part, context = [], None, "", ""
+    for i, b in enumerate(blocks):
+        j = judged.get(i)
+        if j:
+            if j["kind"] in ("front_matter", "back_matter"):
+                current, pending_part = None, ""
+            if j["kind"] == "part":
+                pending_part = context = j["title"]
+                current = None
+                continue
+            if j["kind"] == "chapter":
+                title = f"{pending_part} - {j['title']}" if pending_part and pending_part not in j["title"] else j["title"]
+                # a bare "2" says nothing in an episode list: "The Postman - 2"
+                if re.fullmatch(r"[\[\]\s]*([ivxlc]+|\d+)[\]\s.]*", title, re.I) and context:
+                    title = f"{context} - {title.strip(' []')}"
+                elif not pending_part and len(re.findall(r"[^\W\d_]{3,}", title)) >= 2:   # not OCR junk like "AI"
+                    context = re.sub(r"^[\[\s]*([ivxlc]+|\d+)[\].\s]+(?=\S)", "", title.split(" / ")[0], flags=re.I)
+                current = {"title": title, "text": [], "reason": j.get("reason", "")}
+                chapters.append(current)
+                pending_part = ""
+        if current is not None:
+            current["text"].append(b["text"])
+    # The same chapter found twice in a row (a contents entry anchored at the top of
+    # the page, the real heading lower on it): one chapter.
+    def key(title):   # (words, numbers), with OCR's "Il"/"VIl" read as II/VII
+        toks = re.findall(r"[a-z0-9]+", title.split(" / ")[0].lower())
+        nums = [t.replace("l", "i") for t in toks if re.fullmatch(r"\d+|[ivxl]+", t)]
+        return [t for t in toks if not re.fullmatch(r"\d+|[ivxl]+", t)], nums
+
+    def same(a, b):   # "Chapter 1"/"Chapter 2" and "Street - 2"/"Street - 3" differ
+        (wa, na), (wb, nb) = key(a), key(b)
+        return wa == wb and na == nb and len(" ".join(wa)) >= 8
+    # "Reflections" after each piece of an anthology, "Exercises" after a chapter:
+    # commentary on the chapter before, not an episode of its own
+    follow_up = re.compile(r"(reflections?|commentary|discussion|exercises|problems|questions( for discussion)?"
+                           r"|summary|review questions)\W*$", re.I)
+    deduped = []
+    for c in chapters:
+        if deduped and (same(deduped[-1]["title"], c["title"]) or follow_up.match(c["title"].split(" / ")[0])):
+            deduped[-1]["text"] += c["text"]
+        else:
+            deduped.append(c)
+    chapters = deduped
+    # Short chapters (The Prince's Chapter I is a paragraph) ride along with the
+    # next one, keeping their titles, so they don't vanish from the episode list.
+    out, stubs = [], []
+    for c in chapters:
+        c = {"title": c["title"], "text": "\n\n".join(c["text"]), "reason": c["reason"]}
+        c["words"] = len(c["text"].split())
+        stubs.append(c)
+        if sum(s["words"] for s in stubs) >= MIN_CHAPTER_WORDS:
+            out.append(merge_chapters(stubs))
+            stubs = []
+    if stubs:
+        out.append(merge_chapters(([out.pop()] if out else []) + stubs))
+    return out
+
+
+def merge_chapters(parts):
+    if len(parts) == 1:
+        return parts[0]
+    return {"title": " / ".join(p["title"] for p in parts), "text": "\n\n".join(p["text"] for p in parts),
+            "words": sum(p["words"] for p in parts), "reason": parts[-1]["reason"]}
+
+
+SUMMARY_PROMPT = """Summarise this chapter of "{book}" ({title}) in 3-4 plain sentences: its main
+argument or events and the key ideas a listener should remember. No preamble.
+
+{text}"""
+
+
+def script_of(ch):
+    name = unicodedata.name(ch, "")
+    return name.split(" ")[0] if name else ""
+
+
+def main_script_only(blocks):
+    """Bilingual editions (Loeb: Greek facing English) would feed the podcast
+    writer pages of Greek. Drop blocks written mostly in a script other than the
+    book's main one. Anchors on dropped blocks move to the next kept block."""
+    counts, per_block = {}, []
+    for b in blocks:
+        c = {}
+        for ch in b["text"]:
+            if ch.isalpha():
+                s = script_of(ch)
+                c[s] = c.get(s, 0) + 1
+        per_block.append(c)
+        for s, n in c.items():
+            counts[s] = counts.get(s, 0) + n
+    if not counts:
+        return blocks
+    main = max(counts, key=counts.get)
+    if counts[main] < 0.6 * sum(counts.values()):
+        return blocks   # genuinely mixed: leave it alone
+    kept, carry = [], []
+    for b, c in zip(blocks, per_block):
+        letters = sum(c.values())
+        if letters >= 20 and c.get(main, 0) < 0.5 * letters:
+            carry += b["anchors"]
+            continue
+        if carry:
+            b = {**b, "anchors": carry + b["anchors"]}
+            carry = []
+        kept.append(b)
+    if len(kept) < len(blocks):
+        log(f"  dropped {len(blocks) - len(kept)} text blocks not in the book's main script ({main.title()})")
+    return kept
+
+
+def split_book(src, workdir, resplit=False, known=None):
+    path = workdir / "chapters.json"
+    if path.exists() and not resplit:
+        return json.loads(path.read_text())
+    meta, blocks, toc = read_pdf(src, workdir) if src.suffix.lower() == ".pdf" else read_epub(src)
+    blocks = main_script_only(blocks)
+    if src.suffix.lower() == ".pdf" and known:   # PDF metadata is often "Microsoft Word - draft3.doc"
+        meta = {k: known.get(k) or meta[k] for k in meta}
+    meta["title"] = meta["title"] or src.stem
+    log(f'"{meta["title"]}" by {meta["author"] or "unknown"}: {len(blocks)} text blocks, {len(toc)} TOC entries')
+    judged = detect_chapters(meta, blocks, toc)
+    chapters = build_chapters(blocks, judged)
+    log(f"Summarising {len(chapters)} chapters...")
+    prog = Progress("summaries", len(chapters))
+    for n, c in enumerate(chapters, 1):
+        prog.step(n - 1, f"now: {c['title'][:50]}")
+        c["summary"] = llm_text(SUMMARY_PROMPT.format(book=meta["title"], title=c["title"],
+                                                      text=c["text"][:SUMMARY_INPUT_CHARS]))
+        vlog(f"    {n:>3}. {c['title'][:60]} [{c['words']:,} words]: {c['summary'].split('. ')[0][:110]}.")
+    prog.done()
+    book = {"title": meta["title"], "author": meta["author"], "chapters": chapters,
+            "breaks": [{"block": i, **{k: v for k, v in j.items()}} for i, j in judged.items()]}
+    write_atomic(path, json.dumps(book, indent=1, ensure_ascii=False))
+    return book
+
+
+# ---------------------------------------------------------- Open Notebook side
+
+def parse_range(spec, n):
+    if spec in (None, "all"):
+        return list(range(1, n + 1))
+    picked = set()
+    for part in spec.split(","):
+        a, _, b = part.partition("-")
+        picked.update(range(int(a), int(b or a) + 1))
+    return [i for i in sorted(picked) if 1 <= i <= n]
+
+
+def ensure_notebook(book, state):
+    if state.get("notebook_id"):
+        return state["notebook_id"]
+    nb = http("POST", NOTEBOOK_API + "/notebooks",
+              {"name": book["title"], "description": f"{book['title']} by {book['author']}, split into chapters by book2podcast"})
+    state["notebook_id"] = nb["id"]
+    return nb["id"]
+
+
+def add_source(book, n, chapter, state):
+    key = str(n)
+    if key in state.setdefault("sources", {}):
+        return
+    src = http("POST", NOTEBOOK_API + "/sources/json", {
+        "type": "text", "notebooks": [state["notebook_id"]], "title": f"{n:02d}. {chapter['title']}",
+        "content": chapter["text"], "embed": True, "async_processing": True}, timeout=300)
+    state["sources"][key] = src.get("id")
+
+
+def briefing_suffix(book, n, chapters):
+    ch = chapters[n - 1]
+    earlier = "\n".join(f"- {c['title']}: {c['summary']}" for c in chapters[:n - 1][-6:])
+    return (f"\n\nSERIES CONTEXT: This episode covers chapter {n} of {len(chapters)}, \"{ch['title']}\", "
+            f"from the book \"{book['title']}\"{' by ' + book['author'] if book['author'] else ''}. "
+            "Treat it as one episode in a series that goes through the book chapter by chapter. "
+            "Focus on this chapter only, but briefly connect it to earlier chapters where it helps.\n"
+            + (f"Earlier chapters covered:\n{earlier}\n" if earlier else "This is the first episode of the series.\n"))
+
+
+EPISODES_DIR = Path(setting("OPEN_NOTEBOOK_EPISODES", "open_notebook_episodes",
+                            Path.home() / "open-notebook" / "notebook_data" / "podcasts" / "episodes")).expanduser()
+
+
+class EpisodeWatch:
+    """Stage of a running episode, read from what Open Notebook writes to disk:
+    nothing while the model writes outline and script, then one clips/NNNN.mp3 per
+    line of dialogue as voices are recorded, then the mixed file in audio/."""
+
+    def __init__(self, started):
+        self.started, self.checked, self.folder = started, 0.0, None
+        self.first_clip = None
+        # typical script length, from earlier episodes' transcripts
+        lines = []
+        for t in sorted(EPISODES_DIR.glob("*/transcript.json"), key=lambda p: p.stat().st_mtime)[-10:]:
+            try:
+                lines.append(len(json.loads(t.read_text())))
+            except (OSError, ValueError, TypeError):
+                pass
+        self.expected = sum(lines) // len(lines) if lines else 0
+
+    def describe(self, job_state):
+        spent = time.time() - self.started
+        if self.folder is None and EPISODES_DIR.is_dir():
+            new = [d for d in EPISODES_DIR.iterdir() if d.is_dir() and d.stat().st_mtime >= self.started - 5]
+            self.folder = max(new, key=lambda d: d.stat().st_mtime) if new else None
+        clips = len(list((self.folder / "clips").glob("*.mp3"))) if self.folder else 0
+        if self.folder and any((self.folder / "audio").glob("*.mp3")):
+            return f"  mixing and saving the episode · {clock(spent)}"
+        if clips:
+            self.first_clip = self.first_clip or time.time()
+            rate = clips / max(time.time() - self.first_clip, 1)
+            if self.expected and clips < self.expected:
+                left = f" of ~{self.expected} ({100 * clips // self.expected}%) · ~{clock((self.expected - clips) / rate)} left"
+            else:
+                left = ""
+            return f"  recording voices: {clips} lines{left} · {clock(spent)} in"
+        return f"  writing outline and script ({job_state}) · {clock(spent)}"
+
+
+DONE_STATES = ("completed", "failed", "error", "canceled", "cancelled")
+
+
+def submit_job(name, content, suffix, args):
+    job = http("POST", NOTEBOOK_API + "/podcasts/generate", {
+        "episode_profile": args.profile, "speaker_profile": args.speakers or args.profile,
+        "episode_name": name, "content": content, "briefing_suffix": suffix})
+    return job["job_id"]
+
+
+def job_state(job_id):
+    """The job's status, or None if Open Notebook no longer knows it (e.g. the
+    container restarted and the worker lost it)."""
+    try:
+        return (http("GET", f"{NOTEBOOK_API}/podcasts/jobs/{job_id}") or {}).get("status")
+    except urllib.error.HTTPError as e:
+        if e.code in (404, 422):
+            return None
+        raise
+
+
+def wait_job(job_id, name, started):
+    """Wait for a submitted job (also one submitted by an earlier, interrupted
+    run), return (episode, error)."""
+    j, state = {}, "unknown"
+    watch = EpisodeWatch(started)
+    while True:
+        if time.time() - watch.checked >= 30:   # the job itself, every 30 s
+            watch.checked = time.time()
+            try:
+                j = http("GET", f"{NOTEBOOK_API}/podcasts/jobs/{job_id}") or {}
+            except urllib.error.URLError as e:
+                log(f"  (could not check job: {e}; retrying)")
+                time.sleep(10)
+                continue
+            state = j.get("status", "unknown")
+            if state in DONE_STATES:
+                break
+        status(watch.describe(state))
+        time.sleep(10)
+    log(f"  {state} after {clock(time.time() - started)}")
+    if state != "completed":
+        return None, j.get("error_message") or state
+    matches = [e for e in http("GET", NOTEBOOK_API + "/podcasts/episodes")
+               if e.get("name") == name and e.get("job_status") == "completed"]
+    if not matches:
+        return None, "job completed but the episode was not found"
+    return max(matches, key=lambda e: e.get("created") or ""), None
+
+
+def transcript_words(episode):
+    turns = (episode.get("transcript") or {}).get("transcript", [])
+    return sum(len(t.get("dialogue", "").split()) for t in turns)
+
+
+def speaches_gpu_mib():
+    """GPU memory held by the Speaches (Kokoro/Whisper) process, or None if unknown."""
+    import subprocess
+    try:
+        out = subprocess.run(["nvidia-smi", "--query-compute-apps=process_name,used_memory",
+                              "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=20).stdout
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return sum(int(mem) for name, mem in (l.rsplit(",", 1) for l in out.strip().splitlines() if "," in l)
+               if "speaches" in name)
+
+
+SPEACHES_CONTAINER = setting("SPEACHES_CONTAINER", "speaches_container", "speaches")
+
+
+def restart_speaches():
+    """Restart the Speaches container to free leaked GPU memory. Needs a sudo rule
+    for exactly this one command (the log says how to add it); without one,
+    `sudo -n` fails at once instead of prompting, and the caller keeps waiting."""
+    import subprocess
+    log(f"  Speaches is holding GPU memory with no model loaded; restarting it...")
+    try:
+        r = subprocess.run(["sudo", "-n", "/usr/bin/docker", "restart", SPEACHES_CONTAINER],
+                           capture_output=True, text=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired) as e:
+        log(f"  (could not restart Speaches: {e})")
+        return False
+    if r.returncode != 0:
+        log("  (no permission to restart Speaches automatically; to allow it, run once:\n"
+            f"     echo '{os.environ.get('USER', 'YOUR_USER')} ALL=(root) NOPASSWD: /usr/bin/docker restart "
+            f"{SPEACHES_CONTAINER}' | sudo tee /etc/sudoers.d/book2podcast && sudo chmod 440 /etc/sudoers.d/book2podcast)")
+        return False
+    for _ in range(60):   # until it answers again (one plain try each: http() would back off)
+        try:
+            urllib.request.urlopen(SPEACHES_URL + "/health", timeout=5).close()
+            log("  Speaches restarted; GPU memory released")
+            return True
+        except (urllib.error.URLError, OSError):
+            time.sleep(2)
+    log("  (Speaches did not come back within 2 minutes)")
+    return False
+
+
+def free_gpu(everything=False):
+    """Make room for the LLM before a chapter: Speaches keeps Kokoro on the GPU for
+    minutes after rendering audio, which pushes the next chapter's LLM onto the CPU.
+    everything=True also unloads every Ollama model (Docling wants the whole GPU)."""
+    try:
+        for m in http("GET", SPEACHES_URL + "/api/ps").get("models", []):
+            mid = m if isinstance(m, str) else m.get("id") or m.get("model")
+            try:
+                http("DELETE", SPEACHES_URL + "/api/ps/" + urllib.parse.quote(mid, safe=""), raw=True)
+                log(f"  unloaded {mid} from Speaches")
+            except urllib.error.HTTPError as e:
+                if e.code != 409:   # 409: idle and already counting down its TTL; just wait
+                    raise
+    except (urllib.error.URLError, ValueError) as e:
+        log(f"  (could not unload Speaches models: {e})")
+    held, waited, restarted = speaches_gpu_mib(), 0, False
+    while held is not None and held > 500 and waited < 600:
+        if waited == 0:
+            log(f"  waiting for Speaches to release {held} MiB of GPU memory...")
+        # Kokoro's idle timer (WHISPER__TTL=30) has run out by now; memory still held
+        # is ONNX Runtime's leak, which only a restart gives back
+        if waited >= 60 and not restarted:
+            restarted = True
+            if restart_speaches():
+                held = speaches_gpu_mib()
+                continue
+        time.sleep(10)
+        waited += 10
+        held = speaches_gpu_mib()
+        status(f"  waiting for the GPU: Speaches holds {held} MiB · {clock(waited)}")
+    if held is not None and held > 2000 and not everything:
+        # Its ONNX runtime keeps GPU memory after unloading Kokoro and it grows with
+        # long episodes; past ~2 GB the next chapter's LLM runs out of memory, and
+        # every chapter after it would fail the same way. Stop; a restart frees it.
+        sys.exit(f"\nSpeaches is stuck holding {held} MiB of GPU memory, so the next episode would fail.\n"
+                 f"Restart it:  cd ~/open-notebook && sudo docker restart speaches\n"
+                 f"then run the same command again: finished episodes are kept, failed ones are redone.")
+    if held is not None and held > 500:
+        log(f"  Speaches still holds {held} MiB; continuing anyway (the LLM may run partly on CPU).")
+    # an LLM that loaded while Kokoro was resident may be split onto the CPU; reload it cleanly
+    try:
+        for m in http("GET", OLLAMA_URL + "/api/ps").get("models", []):
+            if everything or m.get("size_vram", 0) < m.get("size", 0):
+                http("POST", OLLAMA_URL + "/api/generate", {"model": m["name"], "keep_alive": 0})
+                log(f"  unloaded {m['name']} from Ollama{'' if everything else ' (was partly on CPU)'}")
+    except urllib.error.URLError:
+        pass
+
+
+def generate_chapter(book, n, args, state):
+    key = str(n)
+    episodes = state.setdefault("episodes", {})
+    if episodes.get(key, {}).get("status") == "completed":
+        log(f"Chapter {n}: episode already done, skipping.")
+        return
+    ch = book["chapters"][n - 1]
+    name = f"{book['title']} - {n:02d}. {ch['title']}"[:200]
+    prev = episodes.get(key, {})
+    if prev.get("status") == "running" and prev.get("job_id"):
+        st = job_state(prev["job_id"])
+        if st is not None and st not in ("failed", "error", "canceled", "cancelled"):
+            log(f"Chapter {n}: picking up the job an earlier run started ({st})...")
+            episode, error = wait_job(prev["job_id"], prev.get("name", name), prev.get("submitted", time.time()))
+            return finish_chapter(n, args, state, prev.get("name", name), episode, error)
+        log(f"Chapter {n}: the earlier job is gone ({st or 'unknown to Open Notebook'}); starting over.")
+    log(f"Chapter {n}: generating \"{name}\" ({ch['words']:,} words of source)...")
+    job_id = submit_job(name, ch["text"], briefing_suffix(book, n, book["chapters"]), args)
+    # recorded before waiting: an interrupted run re-attaches to this job
+    episodes[key] = {"name": name, "status": "running", "job_id": job_id, "submitted": time.time()}
+    save_state(args.workdir, state)
+    vlog(f"  Open Notebook job {job_id}")
+    episode, error = wait_job(job_id, name, episodes[key]["submitted"])
+    finish_chapter(n, args, state, name, episode, error)
+
+
+def finish_chapter(n, args, state, name, episode, error):
+    episodes, key = state.setdefault("episodes", {}), str(n)
+    if error:
+        episodes[key] = {"name": name, "status": "failed", "error": str(error)}
+        save_state(args.workdir, state)
+        log("  failed: " + str(error).replace("\n", "\n  "))
+        return
+    words = transcript_words(episode)
+    episodes[key] = {"name": name, "status": "completed", "episode_id": episode["id"], "words": words}
+    save_state(args.workdir, state)
+    log(f"Chapter {n}: done, {words:,} words (~{words / 150:.0f} min)")
+
+
+def safe_name(text):
+    text = re.sub(r"\s*/\s*", " - ", text)                 # merged titles "A / B" -> "A - B"
+    text = re.sub(r'[\\:*?"<>|\x00-\x1f]+', " ", text)
+    return re.sub(r"\s+", " ", text).strip(" .-")[:150] or "episode"
+
+
+def download_episode(book, n, args, state):
+    """Save a finished episode to <out>/<book>/NN - Title.mp3, tagged so players
+    group it (album = book, track = chapter). Skips files already there."""
+    if args.no_download:
+        return
+    ep = state.get("episodes", {}).get(str(n), {})
+    if ep.get("status") != "completed" or not ep.get("episode_id"):
+        return
+    folder = args.out / safe_name(book["title"])
+    path = folder / f"{n:02d} - {safe_name(book['chapters'][n - 1]['title'])}.mp3"
+    if path.exists():
+        return
+    folder.mkdir(parents=True, exist_ok=True)
+    raw = path.with_suffix(".download")
+    try:
+        http("GET", f"{NOTEBOOK_API}/podcasts/episodes/{urllib.parse.quote(ep['episode_id'])}/audio",
+             timeout=600, to_file=raw)
+    except (urllib.error.URLError, OSError) as e:
+        log(f"  could not download episode {n}: {e} (run the same command again to retry)")
+        raw.unlink(missing_ok=True)
+        return
+    import subprocess
+    tags = {"album": book["title"], "artist": book.get("author") or "", "title": book["chapters"][n - 1]["title"],
+            "track": f"{n}/{len(book['chapters'])}", "genre": "Podcast"}
+    tagged = path.with_suffix(".tagging.mp3")
+    cmd = ["ffmpeg", "-loglevel", "error", "-y", "-i", str(raw), "-c", "copy", "-id3v2_version", "3"]
+    for k, v in tags.items():
+        cmd += ["-metadata", f"{k}={v}"]
+    try:
+        ok = subprocess.run(cmd + [str(tagged)], capture_output=True, timeout=300).returncode == 0
+    except (OSError, subprocess.TimeoutExpired):
+        ok = False
+    if ok:
+        os.replace(tagged, path)
+        raw.unlink(missing_ok=True)
+    else:   # no ffmpeg or it failed: keep the audio untagged
+        tagged.unlink(missing_ok=True)
+        os.replace(raw, path)
+    log(f"  saved {path}")
+
+
+def load_state(workdir):
+    p = workdir / "state.json"
+    return json.loads(p.read_text()) if p.exists() else {}
+
+
+def save_state(workdir, state):
+    write_atomic(workdir / "state.json", json.dumps(state, indent=1))
+
+
+def write_atomic(path, text):
+    """Write via a temp file and rename: a run killed mid-write (out of memory,
+    Ctrl-C) must not leave a half-written chapters.json or state.json behind."""
+    tmp = Path(str(path) + ".tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+# ------------------------------------------------------------------------ main
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("query", nargs="?", help="book title (or author) to search for in Calibre-Web")
+    ap.add_argument("--file", "--epub", dest="file", type=Path,
+                    help="use a local EPUB or PDF file instead of Calibre-Web")
+    ap.add_argument("--list", action="store_true", help="show detected chapters and stop")
+    ap.add_argument("--chapters", default="all",
+                    help='which chapters to turn into episodes, e.g. "3-7", "1,4" (default: all; finished ones are skipped)')
+    ap.add_argument("--profile", default=setting("BOOK2PODCAST_PROFILE", "profile", "deep-dive"),
+                    help="Open Notebook episode profile (default: deep-dive, as created by setup-profiles.sh)")
+    ap.add_argument("--speakers", help="speaker profile (default: same name as --profile)")
+    ap.add_argument("--resplit", action="store_true", help="ignore cached chapters.json and split again")
+    ap.add_argument("--no-notebook", action="store_true", help="don't add chapters as notebook sources")
+    ap.add_argument("--no-podcast", action="store_true", help="only split (and add sources), no episodes")
+    ap.add_argument("--out", type=Path, default=Path.home() / "Podcasts",
+                    help="folder to save finished episodes in, one subfolder per book (default: ~/Podcasts)")
+    ap.add_argument("--no-download", action="store_true", help="leave the episodes in Open Notebook only")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="print every decision: each break's verdict and reason, each chapter summary")
+    args = ap.parse_args()
+    global VERBOSE
+    VERBOSE = args.verbose
+
+    known = None
+    if args.file:
+        args.workdir = CACHE_DIR / slug(args.file.stem)
+        args.workdir.mkdir(parents=True, exist_ok=True)
+        src = args.file
+    elif args.query:
+        src, args.workdir, known = fetch_book(args.query)
+    else:
+        ap.error("give a book title to search for, or --file EPUB/PDF")
+
+    book = split_book(src, args.workdir, args.resplit, known)
+    chapters = book["chapters"]
+    if args.list:
+        print(f"\n{book['title']} - {book['author']}  ({len(chapters)} chapters)\n")
+        for n, c in enumerate(chapters, 1):
+            print(f"{n:3d}. {c['title']}  [{c['words']:,} words]")
+            print(f"     {c['summary'][:300]}")
+        print(f"\nChapters are saved in {args.workdir / 'chapters.json'} (edit to adjust, --resplit to redo).")
+        print('Run without --list to generate every episode (or e.g. --chapters 1-3 for some).')
+        return
+
+    picked = parse_range(args.chapters, len(chapters))
+    log(f"{book['title']}: {len(chapters)} chapters; generating "
+        f"{'all of them' if args.chapters == 'all' else 'chapters ' + args.chapters}.")
+    state = load_state(args.workdir)
+    if not args.no_notebook:
+        ensure_notebook(book, state)
+        for n in picked:
+            add_source(book, n, chapters[n - 1], state)
+        save_state(args.workdir, state)
+        log(f"Chapters {picked[0]}-{picked[-1]} added to notebook \"{book['title']}\".")
+    if not args.no_podcast:
+        todo = [n for n in picked if state.get("episodes", {}).get(str(n), {}).get("status") != "completed"]
+        run_start, finished = time.time(), 0
+        for n in picked:
+            if n in todo:
+                left = ""
+                if finished:
+                    per = (time.time() - run_start) / finished
+                    left = f" · ~{clock(per * (len(todo) - finished))} left for the rest"
+                log(f"[episode {finished + 1} of {len(todo)}]{left}")
+                # not while a job from an earlier run may still be using Kokoro/the LLM
+                if state.get("episodes", {}).get(str(n), {}).get("status") != "running":
+                    free_gpu()
+            generate_chapter(book, n, args, state)
+            download_episode(book, n, args, state)   # also fetches earlier episodes missing from the folder
+            finished += n in todo
+        where = "" if args.no_download else f" and in {args.out / safe_name(book['title'])}"
+        log(f"Done in {clock(time.time() - run_start)}. Episodes are in Open Notebook under Podcasts{where}.")
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        sys.exit("\nStopped. An episode that was being made keeps going in Open Notebook; "
+                 "run the same command again to pick it up and continue.")

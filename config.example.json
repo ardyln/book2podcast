@@ -1,0 +1,10 @@
+{
+  "calibre_url": "http://localhost:8083",
+  "open_notebook_api": "http://localhost:5055/api",
+  "open_notebook_episodes": "~/open-notebook/notebook_data/podcasts/episodes",
+  "ollama_url": "http://localhost:11434",
+  "speaches_url": "http://localhost:8969",
+  "speaches_container": "speaches",
+  "split_model": "gemma4-abliterated-e4b-text:latest",
+  "profile": "deep-dive"
+}

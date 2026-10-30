@@ -1,0 +1,19 @@
+# Chapter detection, summaries and the podcast scripts all run on one small local
+# model. We use an abliterated, text-only GGUF build of Gemma 4 E4B: text-only
+# means no vision projector is loaded, which keeps it fully on a 6 GB GPU.
+# Any Gemma 4 E4B GGUF works; point FROM at the file you downloaded.
+#
+#   ollama create gemma4-abliterated-e4b-text -f Modelfile
+#
+# (The stock model works too: `ollama pull gemma4:e4b`, then set
+#  "split_model": "gemma4:e4b" in ~/.config/book2podcast/config.json and
+#  LLM_MODEL=gemma4:e4b for setup-profiles.sh. A larger num_ctx than its default
+#  helps with long chapters; copy the PARAMETER lines below.)
+
+FROM ./gemma-4-e4b-abliterated-text.gguf
+
+# 62k context: whole chapters fit, plus the book's contents page for the judge
+PARAMETER num_ctx 63488
+PARAMETER temperature 1
+PARAMETER top_k 64
+PARAMETER top_p 0.95
