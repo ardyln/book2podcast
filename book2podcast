@@ -1471,16 +1471,20 @@ def safe_name(text):
     return re.sub(r"\s+", " ", text).strip(" .-")[:150] or "episode"
 
 
-def download_episode(book, n, args, state):
+def episode_path(book, n, args):
+    return args.out / safe_name(book["title"]) / f"{n:02d} - {safe_name(book['chapters'][n - 1]['title'])}.mp3"
+
+
+def download_episode(book, n, args, state, path=None):
     """Save a finished episode to <out>/<book>/NN - Title.mp3, tagged so players
     group it (album = book, track = chapter). Skips files already there."""
-    if args.no_download:
+    if args.no_download and path is None:
         return
     ep = state.get("episodes", {}).get(str(n), {})
     if ep.get("status") != "completed" or not ep.get("episode_id"):
         return
-    folder = args.out / safe_name(book["title"])
-    path = folder / f"{n:02d} - {safe_name(book['chapters'][n - 1]['title'])}.mp3"
+    path = path or episode_path(book, n, args)
+    folder = path.parent
     if path.exists():
         return
     folder.mkdir(parents=True, exist_ok=True)
@@ -1509,7 +1513,150 @@ def download_episode(book, n, args, state):
     else:   # no ffmpeg or it failed: keep the audio untagged
         tagged.unlink(missing_ok=True)
         os.replace(raw, path)
-    log(f"  saved {path}")
+    if not args.no_download:
+        log(f"  saved {path}")
+
+
+# ------------------------------------------------------------ Home Assistant
+
+HA_URL = setting("HA_URL", "ha_url", "").rstrip("/")
+HA_TOKEN = setting("HA_TOKEN", "ha_token", "")
+if not HA_TOKEN and setting("HA_TOKEN_FILE", "ha_token_file", ""):   # share one token file with other tools
+    try:
+        HA_TOKEN = Path(setting("HA_TOKEN_FILE", "ha_token_file", "")).expanduser().read_text().strip()
+    except OSError:
+        pass
+HA_FOLDER = setting("HA_FOLDER", "ha_folder", "Podcasts")
+HA_MAX_UPLOAD = 20 * 1024 * 1024 - 64 * 1024   # HA's media upload limit, minus form overhead
+
+
+_ha_ok = {}
+
+
+def ha_reachable():
+    """Check the token once per run with a tiny request: on a bad token HA closes
+    the connection before reading a 13 MB upload, which would only show up as a
+    confusing "broken pipe"."""
+    if "ok" not in _ha_ok:
+        req = urllib.request.Request(HA_URL + "/api/", headers={"Authorization": f"Bearer {HA_TOKEN}"})
+        try:
+            urllib.request.urlopen(req, timeout=15).close()
+            _ha_ok["ok"] = True
+        except urllib.error.HTTPError as e:
+            log(f"  Home Assistant rejected the token (HTTP {e.code}); run `book2podcast --setup-ha` "
+                "with a new one. Skipping Home Assistant this run.")
+            _ha_ok["ok"] = False
+        except (urllib.error.URLError, OSError) as e:
+            log(f"  Home Assistant is not reachable ({e}); skipping it this run, re-run later to add the episodes.")
+            _ha_ok["ok"] = False
+    return _ha_ok["ok"]
+
+
+def upload_to_ha(book, n, args, state):
+    """Add a finished episode to Home Assistant's media library as
+    <media>/Podcasts/<Book>/NN - Chapter.mp3 (folders appear in the media
+    browser). HA accepts uploads up to 20 MB, so the copy is re-encoded to mono
+    64 kbps (48/32 for very long episodes): speech sounds the same, and the
+    ~/Podcasts copy keeps full quality. A failure is logged, never fatal."""
+    if not (HA_URL and HA_TOKEN) or args.no_ha:
+        return
+    episodes = state.get("episodes", {})
+    ep = episodes.get(str(n), {})
+    if ep.get("status") != "completed" or ep.get("ha"):
+        return
+    if not ha_reachable():
+        return
+    import subprocess
+    import uuid
+    src = episode_path(book, n, args)
+    temp_src = None
+    if not src.exists():   # --no-download: fetch a temporary copy for HA
+        temp_src = args.workdir / f"ha-src-{n:02d}.mp3"
+        download_episode(book, n, args, state, path=temp_src)
+        src = temp_src
+    if not src.exists():
+        return
+    small = args.workdir / f"ha-{n:02d}.mp3"
+    try:
+        for kbps in (64, 48, 32):
+            r = subprocess.run(["ffmpeg", "-loglevel", "error", "-y", "-i", str(src), "-map_metadata", "0",
+                                "-ac", "1", "-b:a", f"{kbps}k", "-id3v2_version", "3", str(small)],
+                               capture_output=True, timeout=600)
+            if r.returncode != 0:
+                if src.stat().st_size > HA_MAX_UPLOAD:
+                    log(f"  could not shrink episode {n} for Home Assistant (ffmpeg failed); skipped")
+                    return
+                shutil.copyfile(src, small)   # small enough as it is
+                break
+            if small.stat().st_size <= HA_MAX_UPLOAD:
+                break
+        else:
+            log(f"  episode {n} is too long for Home Assistant's 20 MB upload limit even at 32 kbps; skipped")
+            return
+        name = episode_path(book, n, args).name
+        target = f"media-source://media_source/local/{HA_FOLDER}/{safe_name(book['title'])}"
+        boundary = uuid.uuid4().hex
+        # the filename as raw UTF-8, as browsers (and HA's own upload button) send it
+        body = (f'--{boundary}\r\nContent-Disposition: form-data; name="media_content_id"\r\n\r\n{target}\r\n'
+                f'--{boundary}\r\nContent-Disposition: form-data; name="file"; filename="{name}"\r\n'
+                f"Content-Type: audio/mpeg\r\n\r\n").encode()
+        body += small.read_bytes() + f"\r\n--{boundary}--\r\n".encode()
+        req = urllib.request.Request(HA_URL + "/api/media_source/local_source/upload", data=body, method="POST",
+                                     headers={"Authorization": f"Bearer {HA_TOKEN}",
+                                              "Content-Type": f"multipart/form-data; boundary={boundary}"})
+        try:
+            with urllib.request.urlopen(req, timeout=300) as resp:
+                ep["ha"] = json.loads(resp.read() or b"{}").get("media_content_id") or target
+        except urllib.error.HTTPError as e:
+            why = {401: "token rejected", 403: "token rejected (it must belong to an admin user)",
+                   413: "file too large for Home Assistant"}.get(e.code, e.read().decode("utf-8", "replace")[:200])
+            log(f"  could not add episode {n} to Home Assistant: HTTP {e.code}, {why}")
+            return
+        except (urllib.error.URLError, OSError) as e:
+            log(f"  could not reach Home Assistant for episode {n}: {e} (re-run to retry)")
+            return
+        save_state(args.workdir, state)
+        log(f"  added to Home Assistant: {HA_FOLDER}/{safe_name(book['title'])}/{name}")
+    finally:
+        small.unlink(missing_ok=True)
+        if temp_src:
+            temp_src.unlink(missing_ok=True)
+
+
+def setup_ha():
+    """Ask for the Home Assistant URL and a long-lived access token (hidden),
+    check them, and save them to the config file (readable only by you)."""
+    if not sys.stdin.isatty():
+        sys.exit("--setup-ha asks for a token: run it in a terminal.")
+    print("Home Assistant: create a token under your profile -> Security -> Long-lived access tokens\n"
+          "(an admin user's token: uploading media needs admin rights).")
+    url = (input(f"  Home Assistant URL [{HA_URL or 'http://homeassistant.local:8123'}]: ").strip()
+           or HA_URL or "http://homeassistant.local:8123").rstrip("/")
+    token = getpass.getpass("  Long-lived access token (hidden): ").strip()
+    req = urllib.request.Request(url + "/api/", headers={"Authorization": f"Bearer {token}"})
+    try:
+        with urllib.request.urlopen(req, timeout=15) as r:
+            ok = "API running" in r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        sys.exit(f"Home Assistant rejected the token (HTTP {e.code}).")
+    except (urllib.error.URLError, OSError) as e:
+        sys.exit(f"Could not reach {url}: {e}")
+    if not ok:
+        sys.exit(f"{url} answered, but it does not look like Home Assistant's API.")
+    folder = input(f"  Folder in the media library [{HA_FOLDER}]: ").strip() or HA_FOLDER
+    cfg_path = CONFIG_DIR / "config.json"
+    try:
+        cfg = json.loads(cfg_path.read_text())
+    except (OSError, ValueError):
+        cfg = {}
+    cfg.update(ha_url=url, ha_token=token, ha_folder=folder)
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    fd = os.open(cfg_path.with_suffix(".tmp"), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        json.dump(cfg, f, indent=2)
+    os.replace(cfg_path.with_suffix(".tmp"), cfg_path)
+    print(f"Saved to {cfg_path}. Finished episodes now also go to Home Assistant's media library\n"
+          f"under {folder}/<Book>/. Re-run a book to add episodes made earlier.")
 
 
 def load_state(workdir):
@@ -1548,11 +1695,17 @@ def main():
     ap.add_argument("--out", type=Path, default=Path.home() / "Podcasts",
                     help="folder to save finished episodes in, one subfolder per book (default: ~/Podcasts)")
     ap.add_argument("--no-download", action="store_true", help="leave the episodes in Open Notebook only")
+    ap.add_argument("--no-ha", action="store_true", help="don't add episodes to Home Assistant's media library this run")
+    ap.add_argument("--setup-ha", action="store_true",
+                    help="connect Home Assistant: asks for its URL and a long-lived access token, then exits")
     ap.add_argument("-v", "--verbose", action="store_true",
                     help="print every decision: each break's verdict and reason, each chapter summary")
     args = ap.parse_args()
     global VERBOSE
     VERBOSE = args.verbose
+    if args.setup_ha:
+        setup_ha()
+        return
 
     known = None
     if args.file:
@@ -1600,8 +1753,11 @@ def main():
                     free_gpu()
             generate_chapter(book, n, args, state)
             download_episode(book, n, args, state)   # also fetches earlier episodes missing from the folder
+            upload_to_ha(book, n, args, state)       # likewise adds earlier ones missing from Home Assistant
             finished += n in todo
         where = "" if args.no_download else f" and in {args.out / safe_name(book['title'])}"
+        if HA_URL and HA_TOKEN and not args.no_ha and _ha_ok.get("ok"):
+            where += f", and in Home Assistant's media library under {HA_FOLDER}/{safe_name(book['title'])}"
         log(f"Done in {clock(time.time() - run_start)}. Episodes are in Open Notebook under Podcasts{where}.")
 
 

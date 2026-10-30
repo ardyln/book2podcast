@@ -6,5 +6,8 @@
   "speaches_url": "http://localhost:8969",
   "speaches_container": "speaches",
   "split_model": "gemma4-abliterated-e4b-text:latest",
-  "profile": "deep-dive"
+  "profile": "deep-dive",
+  "ha_url": "",
+  "ha_token_file": "",
+  "ha_folder": "Podcasts"
 }

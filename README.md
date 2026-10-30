@@ -26,6 +26,8 @@ Calibre-Web ──OPDS──▶ EPUB / PDF
                                        └──▶ voices (Speaches / Kokoro, GPU)
                          │
                  ~/Podcasts/<Book>/NN - Chapter.mp3   (ID3: album, track, title)
+                         │
+             optional:  Home Assistant media library  /media/Podcasts/<Book>/
 ```
 
 A typical chapter becomes a 25-30 minute episode in about 15 minutes. A
@@ -199,6 +201,34 @@ sudo chmod 440 /etc/sudoers.d/book2podcast
 Without it, `book2podcast` waits for Speaches instead, and if it stays stuck,
 stops with instructions rather than failing every remaining chapter.
 
+### Home Assistant media library (optional)
+
+Finished episodes can also go straight into Home Assistant's media library,
+one folder per book, so you can play them on any media player Home Assistant
+controls:
+
+```
+Media → My media → Podcasts → The Philosophy of Linguistics → 01 - Introduction.mp3
+```
+
+```
+book2podcast --setup-ha
+```
+
+asks for your Home Assistant URL and a long-lived access token (Profile →
+Security → Long-lived access tokens; it must belong to an admin, since uploading
+media needs admin rights), checks them, and saves them to the config file. If
+another tool already keeps a token in a file (an MCP server setup, say), point
+`ha_token_file` at that file instead of copying the secret.
+
+From then on every finished episode is uploaded through Home Assistant's own
+media upload API. That API accepts at most 20 MB per file, so the Home Assistant
+copy is re-encoded to mono 64 kbps (48 or 32 for very long episodes), about
+13 MB for half an hour of speech, with the same tags; the copy in `~/Podcasts`
+keeps full quality. Re-running a book uploads only what is missing there, so it
+also backfills episodes made before Home Assistant was set up. `--no-ha` skips
+it for a run.
+
 ## Configuration
 
 `~/.config/book2podcast/config.json` (environment variables override it):
@@ -213,6 +243,9 @@ stops with instructions rather than failing every remaining chapter.
 | `speaches_container` | `SPEACHES_CONTAINER` | `speaches` |
 | `split_model` | `BOOK2PODCAST_SPLIT_MODEL` | `gemma4-abliterated-e4b-text:latest` |
 | `profile` | `BOOK2PODCAST_PROFILE` | `deep-dive` |
+| `ha_url` | `HA_URL` | none (Home Assistant upload off) |
+| `ha_token` or `ha_token_file` | `HA_TOKEN` / `HA_TOKEN_FILE` | none |
+| `ha_folder` | `HA_FOLDER` | `Podcasts` |
 
 The first run asks for your Calibre-Web login (hidden input) and offers to save
 it to `~/.config/book2podcast/calibre.json`, readable only by you. Run that
@@ -229,7 +262,8 @@ book2podcast "Some Book" -v                # also print every decision as it is 
 ```
 
 Other options: `--resplit` (redo chapter detection), `--out DIR`,
-`--no-download`, `--profile NAME`, `--no-notebook`, `--no-podcast`.
+`--no-download`, `--no-ha`, `--setup-ha`, `--profile NAME`, `--no-notebook`,
+`--no-podcast`.
 
 **Resuming.** Re-running a command picks up where it stopped: finished episodes
 are skipped (and downloaded if missing from the folder), an episode that was
