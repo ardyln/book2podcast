@@ -126,13 +126,23 @@ MP3 files that no longer match a chapter number or title are listed, not
 deleted. A book that has not been split yet opens with no chapters, so you can
 skip automatic detection entirely.
 
-### Books without chapters
+### Papers and other texts without chapters
 
-For a monograph or long essay with no chapters to split by, `--whole` skips
-chapter detection and turns all of the text into a single episode. Front and back
-matter (notes, bibliography, index) are included; to leave them out, run
-`--edit` afterwards and press `x` where they begin. Later `--whole` runs keep that
-trimmed version; `--whole --resplit` starts again from the full text.
+For an academic paper (or a monograph or essay with no chapters to split by),
+`--whole` skips chapter detection and turns the text into a single episode:
+
+- The reference list is left out, with everything after it (acknowledgements,
+  appendices): it starts at the first heading named References, Bibliography,
+  Works Cited and the like in the second half of the text.
+- For a local file, the LLM reads the title and authors off the first page,
+  since papers rarely have them in the PDF metadata.
+- The hosts are briefed to follow the paper's argument: its question, method and
+  evidence, findings, and the limits it admits.
+
+To move where the text is cut, run `--edit` afterwards (`x` leaves the text out
+from a line on, Del removes a cut). Later `--whole` runs keep your version;
+`--whole --resplit` starts again. Two different files with the same name (every
+`main.pdf`) are cached separately.
 
 ### How well it works
 
@@ -280,7 +290,7 @@ book2podcast "Some Book"                   # every chapter, saved to ~/Podcasts/
 book2podcast "Some Book" --list            # only split, and show the chapters
 book2podcast "Some Book" --chapters 3-7    # some chapters
 book2podcast "Some Book" --edit            # place the chapter breaks by hand
-book2podcast "Some Monograph" --whole      # no chapters: the whole book as one episode
+book2podcast --file ./paper.pdf --whole    # no chapters (a paper): the whole text as one episode
 book2podcast --file ./book.pdf             # a local EPUB or PDF instead of Calibre-Web
 book2podcast "Some Book" -v                # also print every decision as it is made
 ```
