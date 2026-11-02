@@ -6,6 +6,7 @@ generate one Open Notebook podcast episode per chapter.
   book2podcast "Thinking, Fast and Slow" --list       just show the chapters
   book2podcast "Thinking, Fast and Slow" --chapters 3-7
   book2podcast "Thinking, Fast and Slow" --edit       place the chapter breaks by hand
+  book2podcast "Some Monograph" --whole              no chapters: the whole book as one episode
   book2podcast --file ./book.pdf
 
 Re-running a command resumes: finished episodes are skipped (and downloaded if
@@ -1215,6 +1216,30 @@ def split_book(src, workdir, resplit=False, known=None):
     return book
 
 
+def whole_book(src, workdir, resplit=False, known=None, out=None):
+    """--whole: a monograph with no chapters to split by. All of its text becomes
+    one episode, without chapter detection. A saved one-chapter split (say, one
+    trimmed of its index with --edit) is kept unless --resplit is given."""
+    path = workdir / "chapters.json"
+    old = json.loads(path.read_text()) if path.exists() else None
+    if old and not resplit and (old.get("whole") or len(old["chapters"]) == 1):
+        return {**old, "whole": True}
+    meta, blocks, _ = book_blocks(src, workdir, known)
+    if not blocks:
+        sys.exit(f"No text found in {src}.")
+    if old:   # keep the name the notebook and episode folder already use
+        meta = {"title": old["title"], "author": old["author"]}
+    text = "\n\n".join(b["text"] for b in blocks)
+    reason = "whole book (--whole)"
+    book = {"title": meta["title"], "author": meta["author"], "whole": True,
+            "chapters": [{"title": meta["title"], "text": text, "words": len(text.split()), "reason": reason,
+                          "start": 0, "summary": ""}],
+            "breaks": [{"block": 0, "kind": "chapter", "title": meta["title"], "reason": reason}]}
+    write_atomic(path, json.dumps(book, indent=1, ensure_ascii=False))
+    carry_state(workdir, old, book, out)
+    return book
+
+
 # ------------------------------------------------------ chapter breaks by hand
 
 def starts_at(blocks, i, text):
@@ -1741,6 +1766,11 @@ disagree by saying plainly what seems wrong and why.
 
 def briefing_suffix(book, n, chapters):
     ch = chapters[n - 1]
+    if len(chapters) == 1:
+        return (f"\n\nBOOK CONTEXT: This episode covers the whole book \"{book['title']}\""
+                f"{' by ' + book['author'] if book['author'] else ''} in one go. Follow its argument from "
+                "start to finish: the question it sets out to answer, how it builds its case, and where it ends up.\n"
+                + PLAIN_SPEECH)
     earlier = "\n".join(f"- {c['title']}: {c['summary']}" for c in chapters[:n - 1][-6:])
     return (f"\n\nSERIES CONTEXT: This episode covers chapter {n} of {len(chapters)}, \"{ch['title']}\", "
             f"from the book \"{book['title']}\"{' by ' + book['author'] if book['author'] else ''}. "
@@ -1944,7 +1974,7 @@ def generate_chapter(book, n, args, state):
         log(f"Chapter {n}: episode already done, skipping.")
         return
     ch = book["chapters"][n - 1]
-    name = f"{book['title']} - {n:02d}. {ch['title']}"[:200]
+    name = (book["title"] if book.get("whole") else f"{book['title']} - {n:02d}. {ch['title']}")[:200]
     prev = episodes.get(key, {})
     if prev.get("status") == "running" and prev.get("job_id"):
         st = job_state(prev["job_id"])
@@ -2191,7 +2221,8 @@ def write_atomic(path, text):
 
 def show_chapters(book):
     chapters = book["chapters"]
-    print(f"\n{book['title']} - {book['author']}  ({len(chapters)} chapters)\n")
+    count = "the whole book as one episode" if book.get("whole") else f"{len(chapters)} chapters"
+    print(f"\n{book['title']} - {book['author']}  ({count})\n")
     for n, c in enumerate(chapters, 1):
         print(f"{n:3d}. {c['title']}  [{c['words']:,} words]")
         if c.get("summary"):
@@ -2211,6 +2242,8 @@ def main():
     ap.add_argument("--speakers", help="speaker profile (default: same name as --profile)")
     ap.add_argument("--edit", action="store_true",
                     help="place the chapter breaks by hand in a full-screen editor, starting from the saved split, then stop")
+    ap.add_argument("--whole", action="store_true",
+                    help="the book has no chapters (a monograph): make the whole text one episode, without splitting")
     ap.add_argument("--resplit", action="store_true", help="ignore cached chapters.json and split again")
     ap.add_argument("--no-notebook", action="store_true", help="don't add chapters as notebook sources")
     ap.add_argument("--no-podcast", action="store_true", help="only split (and add sources), no episodes")
@@ -2244,17 +2277,24 @@ def main():
         if book:
             show_chapters(book)
         return
-    book = split_book(src, args.workdir, args.resplit, known)
+    if args.whole:
+        book = whole_book(src, args.workdir, args.resplit, known, args.out)
+    else:
+        book = split_book(src, args.workdir, args.resplit, known)
     chapters = book["chapters"]
     if args.list:
         show_chapters(book)
         print(f"\nChapters are saved in {args.workdir / 'chapters.json'} (--edit to adjust, --resplit to redo).")
-        print('Run without --list to generate every episode (or e.g. --chapters 1-3 for some).')
+        print("Run without --list to generate the episode." if book.get("whole") else
+              "Run without --list to generate every episode (or e.g. --chapters 1-3 for some).")
         return
 
     picked = parse_range(args.chapters, len(chapters))
-    log(f"{book['title']}: {len(chapters)} chapters; generating "
-        f"{'all of them' if args.chapters == 'all' else 'chapters ' + args.chapters}.")
+    if book.get("whole"):
+        log(f"{book['title']}: the whole book ({chapters[0]['words']:,} words) as one episode.")
+    else:
+        log(f"{book['title']}: {len(chapters)} chapters; generating "
+            f"{'all of them' if args.chapters == 'all' else 'chapters ' + args.chapters}.")
     state = load_state(args.workdir)
     if not args.no_notebook:
         ensure_notebook(book, state)

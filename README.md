@@ -126,6 +126,14 @@ MP3 files that no longer match a chapter number or title are listed, not
 deleted. A book that has not been split yet opens with no chapters, so you can
 skip automatic detection entirely.
 
+### Books without chapters
+
+For a monograph or long essay with no chapters to split by, `--whole` skips
+chapter detection and turns all of the text into a single episode. Front and back
+matter (notes, bibliography, index) are included; to leave them out, run
+`--edit` afterwards and press `x` where they begin. Later `--whole` runs keep that
+trimmed version; `--whole --resplit` starts again from the full text.
+
 ### How well it works
 
 Developed against 35 books: public-domain test cases plus a personal library of
@@ -272,6 +280,7 @@ book2podcast "Some Book"                   # every chapter, saved to ~/Podcasts/
 book2podcast "Some Book" --list            # only split, and show the chapters
 book2podcast "Some Book" --chapters 3-7    # some chapters
 book2podcast "Some Book" --edit            # place the chapter breaks by hand
+book2podcast "Some Monograph" --whole      # no chapters: the whole book as one episode
 book2podcast --file ./book.pdf             # a local EPUB or PDF instead of Calibre-Web
 book2podcast "Some Book" -v                # also print every decision as it is made
 ```
