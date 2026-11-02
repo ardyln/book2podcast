@@ -5,6 +5,7 @@ generate one Open Notebook podcast episode per chapter.
   book2podcast "Thinking, Fast and Slow"              every chapter, saved to ~/Podcasts
   book2podcast "Thinking, Fast and Slow" --list       just show the chapters
   book2podcast "Thinking, Fast and Slow" --chapters 3-7
+  book2podcast "Thinking, Fast and Slow" --edit       place the chapter breaks by hand
   book2podcast --file ./book.pdf
 
 Re-running a command resumes: finished episodes are skipped (and downloaded if
@@ -20,12 +21,14 @@ with Ollama and Kokoro unloaded: its layout model recovers headings and drops
 page headers/footers, and the PDF's bookmarks act as the table of contents.
 Docling exits before the LLM loads, so they never share the GPU.
 
-Work is cached in ~/.cache/book2podcast/<book>/ - edit chapters.json there to
-fix a split by hand; it is reused on the next run unless --resplit is given.
+Work is cached in ~/.cache/book2podcast/<book>/chapters.json; --edit opens it in
+a full-screen editor to fix a split by hand. It is reused on the next run unless
+--resplit is given.
 """
 
 import argparse
 import base64
+import curses
 import getpass
 import html
 import json
@@ -34,6 +37,7 @@ import posixpath
 import re
 import shutil
 import sys
+import textwrap
 import time
 import unicodedata
 import urllib.error
@@ -1079,7 +1083,7 @@ def build_chapters(blocks, judged):
                     title = f"{context} - {title.strip(' []')}"
                 elif not pending_part and len(re.findall(r"[^\W\d_]{3,}", title)) >= 2:   # not OCR junk like "AI"
                     context = re.sub(r"^[\[\s]*([ivxlc]+|\d+)[\].\s]+(?=\S)", "", title.split(" / ")[0], flags=re.I)
-                current = {"title": title, "text": [], "reason": j.get("reason", "")}
+                current = {"title": title, "text": [], "reason": j.get("reason", ""), "start": i}
                 chapters.append(current)
                 pending_part = ""
         if current is not None:
@@ -1109,7 +1113,7 @@ def build_chapters(blocks, judged):
     # next one, keeping their titles, so they don't vanish from the episode list.
     out, stubs = [], []
     for c in chapters:
-        c = {"title": c["title"], "text": "\n\n".join(c["text"]), "reason": c["reason"]}
+        c = {"title": c["title"], "text": "\n\n".join(c["text"]), "reason": c["reason"], "start": c["start"]}
         c["words"] = len(c["text"].split())
         stubs.append(c)
         if sum(s["words"] for s in stubs) >= MIN_CHAPTER_WORDS:
@@ -1124,7 +1128,7 @@ def merge_chapters(parts):
     if len(parts) == 1:
         return parts[0]
     return {"title": " / ".join(p["title"] for p in parts), "text": "\n\n".join(p["text"] for p in parts),
-            "words": sum(p["words"] for p in parts), "reason": parts[-1]["reason"]}
+            "words": sum(p["words"] for p in parts), "reason": parts[-1]["reason"], "start": parts[0]["start"]}
 
 
 SUMMARY_PROMPT = """Summarise this chapter of "{book}" ({title}) in 3-4 plain sentences: its main
@@ -1172,30 +1176,518 @@ def main_script_only(blocks):
     return kept
 
 
-def split_book(src, workdir, resplit=False, known=None):
-    path = workdir / "chapters.json"
-    if path.exists() and not resplit:
-        return json.loads(path.read_text())
+def book_blocks(src, workdir, known=None):
     meta, blocks, toc = read_pdf(src, workdir) if src.suffix.lower() == ".pdf" else read_epub(src)
     blocks = main_script_only(blocks)
     if src.suffix.lower() == ".pdf" and known:   # PDF metadata is often "Microsoft Word - draft3.doc"
         meta = {k: known.get(k) or meta[k] for k in meta}
     meta["title"] = meta["title"] or src.stem
-    log(f'"{meta["title"]}" by {meta["author"] or "unknown"}: {len(blocks)} text blocks, {len(toc)} TOC entries')
-    judged = detect_chapters(meta, blocks, toc)
-    chapters = build_chapters(blocks, judged)
-    log(f"Summarising {len(chapters)} chapters...")
-    prog = Progress("summaries", len(chapters))
-    for n, c in enumerate(chapters, 1):
+    return meta, blocks, toc
+
+
+def summarise(meta, chapters):
+    """Summaries for the chapters that have none yet (they brief later episodes)."""
+    todo = [c for c in chapters if not c.get("summary")]
+    if not todo:
+        return
+    log(f"Summarising {len(todo)} chapters...")
+    prog = Progress("summaries", len(todo))
+    for n, c in enumerate(todo, 1):
         prog.step(n - 1, f"now: {c['title'][:50]}")
         c["summary"] = llm_text(SUMMARY_PROMPT.format(book=meta["title"], title=c["title"],
                                                       text=c["text"][:SUMMARY_INPUT_CHARS]))
         vlog(f"    {n:>3}. {c['title'][:60]} [{c['words']:,} words]: {c['summary'].split('. ')[0][:110]}.")
     prog.done()
+
+
+def split_book(src, workdir, resplit=False, known=None):
+    path = workdir / "chapters.json"
+    if path.exists() and not resplit:
+        return json.loads(path.read_text())
+    meta, blocks, toc = book_blocks(src, workdir, known)
+    log(f'"{meta["title"]}" by {meta["author"] or "unknown"}: {len(blocks)} text blocks, {len(toc)} TOC entries')
+    judged = detect_chapters(meta, blocks, toc)
+    chapters = build_chapters(blocks, judged)
+    summarise(meta, chapters)
     book = {"title": meta["title"], "author": meta["author"], "chapters": chapters,
             "breaks": [{"block": i, **{k: v for k, v in j.items()}} for i, j in judged.items()]}
     write_atomic(path, json.dumps(book, indent=1, ensure_ascii=False))
     return book
+
+
+# ------------------------------------------------------ chapter breaks by hand
+
+def starts_at(blocks, i, text):
+    """Whether text (a chapter's) begins with block i and the ones after it."""
+    want, got = text[:500], ""
+    while i < len(blocks) and len(got) < len(want):
+        got += ("\n\n" if got else "") + blocks[i]["text"]
+        i += 1
+    return got[:len(want)] == want
+
+
+def chapter_marks(blocks, book):
+    """A saved split as editor marks, {block: {"title", "skip"}}: each chapter's
+    first block, plus a "skip" mark where text it left out begins (a part divider,
+    back matter). Text before the first mark is left out."""
+    marks, pos = {}, 0
+    for c in (book or {}).get("chapters", []):
+        start = c.get("start")
+        if start is None or not starts_at(blocks, start, c["text"]):
+            # saved before chapters recorded their first block
+            start = next((i for i in range(pos, len(blocks)) if starts_at(blocks, i, c["text"])), None)
+            if start is None:
+                continue
+        end, size = start, -2
+        while end < len(blocks) and size < len(c["text"]):
+            size += len(blocks[end]["text"]) + 2
+            end += 1
+        marks[start] = {"title": c["title"], "skip": False}
+        marks.setdefault(end, {"title": "", "skip": True})
+        pos = end
+    marks.pop(len(blocks), None)
+    return marks
+
+
+def toc_blocks(blocks, toc):
+    """Blocks that a table-of-contents entry or PDF bookmark points at."""
+    first, anchored = {}, {}
+    for i, b in enumerate(blocks):
+        first.setdefault(b["file"], i)
+        for a in b["anchors"]:
+            anchored.setdefault((b["file"], a), i)
+    hits = set()
+    for href, *_ in toc:
+        file, _, frag = href.partition("#")
+        i = anchored.get((file, frag)) if frag else first.get(file)
+        if i is not None:
+            hits.add(i)
+    return hits
+
+
+def chapters_from_marks(blocks, marks):
+    starts = sorted(marks) + [len(blocks)]
+    chapters = []
+    for a, b in zip(starts, starts[1:]):
+        if marks[a]["skip"]:
+            continue
+        text = "\n\n".join(x["text"] for x in blocks[a:b])
+        chapters.append({"title": marks[a]["title"], "text": text, "reason": "set by hand", "start": a,
+                         "words": len(text.split())})
+    return chapters
+
+
+def heading_title(text):
+    text = " ".join(text.split())
+    return text if len(text) <= 80 else text[:80].rsplit(" ", 1)[0] + "..."
+
+
+class ChapterEditor:
+    """Full-screen list of the book's text blocks (book2podcast --edit), for
+    placing chapter breaks by hand. A mark on a block starts a chapter there, or
+    starts text to leave out; text before the first mark is left out."""
+
+    HINT = ("Enter chapter starts here · x leave out from here · Del remove break · t title · u undo · "
+            "[ ] breaks · p page · / search · ? help · w save · q quit")
+    HELP = [
+        ("Up Down PgUp PgDn Home End", "move (also j k, space, g G)"),
+        ("Enter", "a chapter starts on this line (on a chapter's first line: rename it)"),
+        ("x", "leave text out from this line on: front matter, notes, index..."),
+        ("Del / Backspace / d", "remove the break on this line (joins it to the one before)"),
+        ("s", "leave out, or bring back, the whole chapter the cursor is in"),
+        ("t", "rename the chapter the cursor is in"),
+        ("u", "undo"),
+        ("[  ]", "previous / next break"),
+        ("{  }", "previous / next heading (bold lines)"),
+        ("<  >", "previous / next line the table of contents or bookmarks point at (marked =)"),
+        ("p", "go to a page: the PDF page, as your PDF viewer numbers it"),
+        ("/  n", "search, next match"),
+        ("w", "save and quit"),
+        ("q", "quit without saving"),
+        ("", ""),
+        ("", "Text before the first chapter is always left out. Each chapter becomes one episode."),
+        ("", "Finished episodes whose chapter text you don't change are kept."),
+    ]
+
+    def __init__(self, scr, title, blocks, marks, hints):
+        self.scr, self.title, self.blocks, self.hints = scr, title, blocks, hints
+        self.marks = {i: dict(m) for i, m in marks.items()}
+        self.saved = json.dumps(sorted(self.marks.items()))
+        self.words = [len(b["text"].split()) for b in blocks]
+        self.headings = [i for i, b in enumerate(blocks) if b["level"]]
+        self.pages = all("page" in b for b in blocks)
+        self.cur, self.top, self.query, self.undo = min(self.marks, default=0), 0, "", []
+        self.message = "" if self.marks else ("No chapters yet: press Enter on the first line of each chapter "
+                                              "(= marks lines the table of contents points at). ? for help")
+        try:
+            curses.curs_set(0)
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_CYAN, -1)
+            curses.init_pair(2, curses.COLOR_YELLOW, -1)
+        except curses.error:
+            pass
+        self.layout()
+
+    def layout(self):
+        """Display rows: a header row before each chapter or left-out stretch, then its blocks."""
+        starts = sorted(self.marks)
+        bounds = ([0] if not starts or starts[0] > 0 else []) + starts + [len(self.blocks)]
+        self.rows, self.row_of = [], {}
+        self.seg_start, self.kept = [None] * len(self.blocks), [False] * len(self.blocks)
+        self.chapters = self.kept_words = 0
+        for a, b in zip(bounds, bounds[1:]):
+            m = self.marks.get(a)
+            words = sum(self.words[a:b])
+            kept = bool(m and not m["skip"])
+            if kept:
+                self.chapters += 1
+                self.kept_words += words
+                label = f"{self.chapters}. {m['title'] or '(untitled)'} · {words:,} words"
+                if words < MIN_CHAPTER_WORDS:
+                    label += " · very short"
+            else:
+                label = f"left out{'' if m else ' (before the first chapter)'} · {words:,} words"
+            self.rows.append(("head", label, kept))
+            for i in range(a, b):
+                self.seg_start[i], self.kept[i] = (a if m else None), kept
+                self.row_of[i] = len(self.rows)
+                self.rows.append(("block", i))
+
+    def put(self, y, x, text, attr=0):
+        h, w = self.scr.getmaxyx()
+        if 0 <= y < h and x < w:
+            try:
+                self.scr.addnstr(y, x, text, w - x, attr)
+            except curses.error:   # writing the bottom-right cell
+                pass
+
+    def sizes(self):
+        h, _ = self.scr.getmaxyx()
+        preview = max(2, min(6, h // 4))
+        return preview, max(1, h - preview - 3)
+
+    def draw(self):
+        self.scr.erase()
+        h, w = self.scr.getmaxyx()
+        preview, list_h = self.sizes()
+        r = self.row_of[self.cur]
+        want = r - 1 if self.rows[r - 1][0] == "head" else r   # keep a chapter's header in view
+        if want < self.top - list_h // 2 or r >= self.top + list_h + list_h // 2:   # a jump: land a third down
+            self.top = max(0, want - list_h // 3)
+        self.top = min(self.top, want)
+        self.top = max(self.top, r - list_h + 1)
+        b = self.blocks[self.cur]
+        where = f"page {b['page']} " if self.pages else f"block {self.cur + 1} of {len(self.blocks)} "
+        bar = f" {self.title} · {self.chapters} chapters · {self.kept_words:,} words in episodes"
+        self.put(0, 0, bar[:max(0, w - len(where))].ljust(w - len(where)) + where, curses.A_REVERSE)
+        for y, row in enumerate(self.rows[self.top:self.top + list_h], 1):
+            if row[0] == "head":
+                _, label, kept = row
+                attr = curses.color_pair(1) | curses.A_BOLD if kept else curses.color_pair(2)
+                self.put(y, 0, f"── {label} ".ljust(w, "─"), attr)
+                continue
+            i = row[1]
+            blk = self.blocks[i]
+            page = f"{blk['page']:>4} " if self.pages else ""
+            attr = curses.A_BOLD if blk["level"] else curses.A_NORMAL
+            if i == self.cur:
+                attr |= curses.A_REVERSE
+            elif not self.kept[i]:
+                attr |= curses.A_DIM
+            self.put(y, 0, f"{'=' if i in self.hints else ' '}{page} {' '.join(blk['text'].split())}".ljust(w), attr)
+        y = 1 + list_h
+        self.put(y, 0, "─" * w, curses.A_DIM)
+        lines, i = [], self.cur   # the current line in full, then the text after it
+        while len(lines) < preview and i < len(self.blocks):
+            attr = curses.A_BOLD if i == self.cur else curses.A_DIM
+            lines += [(t, attr) for t in textwrap.wrap(" ".join(self.blocks[i]["text"].split()), max(10, w - 2))]
+            i += 1
+        for k, (line, attr) in enumerate(lines[:preview]):
+            self.put(y + 1 + k, 1, line, attr)
+        self.put(h - 1, 0, self.message or self.HINT, curses.A_BOLD if self.message else curses.A_DIM)
+        self.scr.refresh()
+
+    def ask(self, prompt, initial=""):
+        """A one-line text field on the bottom row; None if Esc."""
+        buf, pos = list(initial), len(initial)
+        try:
+            curses.curs_set(1)
+        except curses.error:
+            pass
+        try:
+            while True:
+                h, w = self.scr.getmaxyx()
+                room = max(1, w - len(prompt) - 1)
+                first = max(0, pos - room + 1)
+                self.scr.move(h - 1, 0)
+                self.scr.clrtoeol()
+                self.put(h - 1, 0, prompt, curses.A_BOLD)
+                self.put(h - 1, len(prompt), "".join(buf[first:first + room]))
+                self.scr.move(h - 1, min(w - 1, len(prompt) + pos - first))
+                k = self.scr.get_wch()
+                if k in ("\n", "\r", curses.KEY_ENTER):
+                    return "".join(buf).strip()
+                if k == "\x1b":
+                    return None
+                if k in (curses.KEY_BACKSPACE, "\x7f", "\b"):
+                    if pos:
+                        del buf[pos - 1]
+                        pos -= 1
+                elif k == curses.KEY_DC:
+                    del buf[pos:pos + 1]
+                elif k == curses.KEY_LEFT:
+                    pos = max(0, pos - 1)
+                elif k == curses.KEY_RIGHT:
+                    pos = min(len(buf), pos + 1)
+                elif k in (curses.KEY_HOME, "\x01"):
+                    pos = 0
+                elif k in (curses.KEY_END, "\x05"):
+                    pos = len(buf)
+                elif k == "\x15":   # Ctrl-U: clear
+                    del buf[:pos]
+                    pos = 0
+                elif isinstance(k, str) and k.isprintable():
+                    buf.insert(pos, k)
+                    pos += 1
+        finally:
+            try:
+                curses.curs_set(0)
+            except curses.error:
+                pass
+
+    def change(self, at, mark):
+        """Set (or with None remove) the mark on a block, undoably."""
+        self.undo.append({i: dict(m) for i, m in self.marks.items()})
+        if mark is None:
+            self.marks.pop(at, None)
+        else:
+            self.marks[at] = mark
+        self.layout()
+
+    def start_chapter(self):
+        m = self.marks.get(self.cur)
+        if m and not m["skip"]:
+            return self.rename()
+        title = self.ask("Chapter title: ", (m and m["title"]) or heading_title(self.blocks[self.cur]["text"]))
+        if title is not None:
+            self.change(self.cur, {"title": title or heading_title(self.blocks[self.cur]["text"]), "skip": False})
+
+    def leave_out(self):
+        m = self.marks.get(self.cur)
+        if m and m["skip"]:
+            self.message = "Text is already left out from here (Del removes this break)."
+            return
+        self.change(self.cur, {"title": m["title"] if m else "", "skip": True})
+        self.message = "Leaving out the text from here to the next break."
+
+    def remove(self):
+        if self.cur not in self.marks:
+            self.message = "No break on this line ([ and ] jump to the breaks)."
+            return
+        self.change(self.cur, None)
+
+    def toggle_segment(self):
+        a = self.seg_start[self.cur]
+        if a is None:
+            self.message = "Text before the first chapter is always left out; press Enter to start a chapter here."
+            return
+        m = self.marks[a]
+        title = m["title"]
+        if m["skip"] and not title:
+            title = self.ask("Chapter title: ", heading_title(self.blocks[a]["text"]))
+            if title is None:
+                return
+        self.change(a, {"title": title or heading_title(self.blocks[a]["text"]), "skip": not m["skip"]})
+
+    def rename(self):
+        a = self.seg_start[self.cur]
+        if a is None or self.marks[a]["skip"]:
+            self.message = "The cursor is in left-out text, not in a chapter."
+            return
+        title = self.ask("Chapter title: ", self.marks[a]["title"])
+        if title and title != self.marks[a]["title"]:
+            self.change(a, {"title": title, "skip": False})
+
+    def jump(self, targets, forward, what):
+        found = [i for i in targets if i > self.cur] if forward else [i for i in targets if i < self.cur]
+        if found:
+            self.cur = found[0] if forward else found[-1]
+        else:
+            self.message = f"No {what} {'below' if forward else 'above'}."
+
+    def goto_page(self):
+        if not self.pages:
+            self.message = "This book has no page numbers (EPUB); use / to search instead."
+            return
+        page = self.ask("Go to page (as your PDF viewer numbers it): ")
+        if page and page.isdigit():
+            self.cur = next((i for i, b in enumerate(self.blocks) if b["page"] >= int(page)), len(self.blocks) - 1)
+        elif page:
+            self.message = "A page is a number."
+
+    def search(self, ask):
+        if ask:
+            query = self.ask("Search: ", self.query)
+            if not query:
+                return
+            self.query = query
+        if not self.query:
+            self.message = "Press / to search first."
+            return
+        q, n = self.query.casefold(), len(self.blocks)
+        for k in range(1, n + 1):
+            i = (self.cur + k) % n
+            if q in self.blocks[i]["text"].casefold():
+                if i <= self.cur:
+                    self.message = "Search continued from the top."
+                self.cur = i
+                return
+        self.message = f'"{self.query}" not found.'
+
+    def help(self):
+        self.scr.erase()
+        self.put(0, 0, " Placing chapter breaks ", curses.A_REVERSE)
+        for y, (keys, what) in enumerate(self.HELP, 2):
+            self.put(y, 2, keys, curses.A_BOLD)
+            self.put(y, 30 if keys else 2, what)
+        self.put(len(self.HELP) + 3, 2, "Any key to go back.", curses.A_DIM)
+        self.scr.refresh()
+        self.scr.get_wch()
+
+    def run(self):
+        """The marks to save, or None to quit without saving."""
+        while True:
+            self.draw()
+            key = self.scr.get_wch()
+            self.message = ""
+            if key in (curses.KEY_UP, "k"):
+                self.cur = max(0, self.cur - 1)
+            elif key in (curses.KEY_DOWN, "j"):
+                self.cur = min(len(self.blocks) - 1, self.cur + 1)
+            elif key == curses.KEY_PPAGE:
+                self.cur = max(0, self.cur - self.sizes()[1] + 1)
+            elif key in (curses.KEY_NPAGE, " "):
+                self.cur = min(len(self.blocks) - 1, self.cur + self.sizes()[1] - 1)
+            elif key in (curses.KEY_HOME, "g"):
+                self.cur = 0
+            elif key in (curses.KEY_END, "G"):
+                self.cur = len(self.blocks) - 1
+            elif key in ("\n", "\r", curses.KEY_ENTER):
+                self.start_chapter()
+            elif key == "x":
+                self.leave_out()
+            elif key in (curses.KEY_DC, curses.KEY_BACKSPACE, "\x7f", "\b", "d"):
+                self.remove()
+            elif key == "s":
+                self.toggle_segment()
+            elif key == "t":
+                self.rename()
+            elif key == "u":
+                if self.undo:
+                    self.marks = self.undo.pop()
+                    self.layout()
+                else:
+                    self.message = "Nothing to undo."
+            elif key in ("[", "]"):
+                self.jump(sorted(self.marks), key == "]", "break")
+            elif key in ("{", "}"):
+                self.jump(self.headings, key == "}", "heading")
+            elif key in ("<", ">"):
+                self.jump(sorted(self.hints), key == ">", "table of contents entry")
+            elif key == "p":
+                self.goto_page()
+            elif key in ("/", "n"):
+                self.search(ask=key == "/")
+            elif key == "?":
+                self.help()
+            elif key == "w":
+                if any(not m["skip"] for m in self.marks.values()):
+                    return self.marks
+                self.message = "No chapters to save yet: press Enter on the first line of a chapter."
+            elif key == "q":
+                if json.dumps(sorted(self.marks.items())) == self.saved:
+                    return None
+                self.message = "Quit without saving your changes? y/n"
+                self.draw()
+                if self.scr.get_wch() in ("y", "Y"):
+                    return None
+                self.message = ""
+
+
+def edit_split(src, workdir, known, out):
+    """book2podcast --edit: place the chapter breaks by hand, starting from the
+    saved split, and save chapters.json. Notebook sources and episodes of chapters
+    whose text is unchanged are kept, under their new numbers."""
+    if not (sys.stdin.isatty() and sys.stdout.isatty()):
+        sys.exit("--edit needs an interactive terminal.")
+    path = workdir / "chapters.json"
+    old = json.loads(path.read_text()) if path.exists() else None
+    meta, blocks, toc = book_blocks(src, workdir, known)
+    if not blocks:
+        sys.exit(f"No text found in {src}.")
+    if old:   # keep the name the notebook and episode folder already use
+        meta = {"title": old["title"], "author": old["author"]}
+    marks, hints = chapter_marks(blocks, old), toc_blocks(blocks, toc)
+    os.environ.setdefault("ESCDELAY", "25")   # Esc cancels a prompt without a 1 s wait
+    marks = curses.wrapper(lambda scr: ChapterEditor(scr, meta["title"], blocks, marks, hints).run())
+    if marks is None:
+        log("Quit without saving; the chapters are unchanged.")
+        return None
+    chapters = chapters_from_marks(blocks, marks)
+    known_summary = {c["text"]: c.get("summary") for c in old["chapters"]} if old else {}
+    for c in chapters:
+        if known_summary.get(c["text"]):
+            c["summary"] = known_summary[c["text"]]
+    try:
+        summarise(meta, chapters)
+    except (urllib.error.URLError, OSError) as e:
+        log(f"Could not summarise the new chapters ({e}); saved without summaries. "
+            "Run --edit again and press w once Ollama is up to add them.")
+        for c in chapters:
+            c.setdefault("summary", "")
+    book = {"title": meta["title"], "author": meta["author"], "chapters": chapters,
+            "breaks": [{"block": i, "kind": "left_out" if m["skip"] else "chapter", "title": m["title"],
+                        "reason": "set by hand"} for i, m in sorted(marks.items())]}
+    write_atomic(path, json.dumps(book, indent=1, ensure_ascii=False))
+    carry_state(workdir, old, book, out)
+    return book
+
+
+def carry_state(workdir, old, book, out):
+    """After a hand edit, notebook sources and episodes follow their chapter to its
+    new number; those of chapters whose text changed are dropped (made anew)."""
+    state = load_state(workdir)
+    if not old or not (state.get("sources") or state.get("episodes")):
+        return
+    old_number = {c["text"]: n for n, c in enumerate(old["chapters"], 1)}
+    moved = {}   # old number -> new number
+    for n, c in enumerate(book["chapters"], 1):
+        if c["text"] in old_number:
+            moved[old_number[c["text"]]] = n
+    stale = []
+    for key, ep in state.get("episodes", {}).items():
+        o = int(key)
+        n = moved.get(o)
+        title_was = old["chapters"][o - 1]["title"] if o <= len(old["chapters"]) else ""
+        if n == o and book["chapters"][n - 1]["title"] == title_was:
+            continue
+        ep.pop("ha", None)   # Home Assistant gets it again under the new number/title
+        f = out / safe_name(book["title"]) / f"{o:02d} - {safe_name(title_was)}.mp3"
+        if f.exists():
+            stale.append(f)
+    dropped = sum(1 for k, ep in state.get("episodes", {}).items()
+                  if int(k) not in moved and ep.get("status") == "completed")
+    for part in ("sources", "episodes"):
+        state[part] = {str(moved[int(k)]): v for k, v in state.get(part, {}).items() if int(k) in moved}
+    save_state(workdir, state)
+    kept = sum(ep.get("status") == "completed" for ep in state["episodes"].values())
+    log(f"Kept {kept} finished episode{'s' * (kept != 1)} whose chapter text is unchanged"
+        + (f"; {dropped} for chapters you changed will be made again" if dropped else "") + ".")
+    if stale:
+        log("These files no longer match their chapter's number or title (kept episodes are saved again "
+            "under the new name on the next run); delete them if you don't want them:")
+        for f in stale:
+            log(f"  {f}")
 
 
 # ---------------------------------------------------------- Open Notebook side
@@ -1229,6 +1721,24 @@ def add_source(book, n, chapter, state):
     state["sources"][key] = src.get("id")
 
 
+# Sent with every episode, so it applies whatever episode profile is installed.
+PLAIN_SPEECH = """
+PLAIN SPEECH: The hosts talk like real people, not like AI-written text. Never use these patterns:
+- Contrast framing: "it's not X, it's Y", "this isn't about X, it's about Y", "not just X but Y", \
+"less X and more Y". Just say what the thing is.
+- Buzzwords: load-bearing, push back / pushback, unpack, delve, dive into, double-click, lean into, \
+landscape, tapestry, nuanced, robust, crucial, pivotal, paradigm shift, game-changer, mind-blowing, \
+fascinating, profound, resonate, at its core, the heart of, navigate, journey, intersection.
+- Stock reactions and fillers: "Exactly.", "Absolutely.", "That's a great point", "That's the key", \
+"Here's the thing", "Here's the kicker", "And that's the point", "Let that sink in", "Think about that", \
+"Make no mistake", "It's worth noting", "In other words", "the real question is", "what's really going on".
+- Rhetorical setups that answer themselves ("So what does this mean? It means..."), lists of three for \
+rhythm, and ending a turn on a punchy one-line moral.
+Instead, use ordinary words, react in varied and specific ways (to the actual detail just said), and \
+disagree by saying plainly what seems wrong and why.
+"""
+
+
 def briefing_suffix(book, n, chapters):
     ch = chapters[n - 1]
     earlier = "\n".join(f"- {c['title']}: {c['summary']}" for c in chapters[:n - 1][-6:])
@@ -1236,7 +1746,8 @@ def briefing_suffix(book, n, chapters):
             f"from the book \"{book['title']}\"{' by ' + book['author'] if book['author'] else ''}. "
             "Treat it as one episode in a series that goes through the book chapter by chapter. "
             "Focus on this chapter only, but briefly connect it to earlier chapters where it helps.\n"
-            + (f"Earlier chapters covered:\n{earlier}\n" if earlier else "This is the first episode of the series.\n"))
+            + (f"Earlier chapters covered:\n{earlier}\n" if earlier else "This is the first episode of the series.\n")
+            + PLAIN_SPEECH)
 
 
 EPISODES_DIR = Path(setting("OPEN_NOTEBOOK_EPISODES", "open_notebook_episodes",
@@ -1678,6 +2189,15 @@ def write_atomic(path, text):
 
 # ------------------------------------------------------------------------ main
 
+def show_chapters(book):
+    chapters = book["chapters"]
+    print(f"\n{book['title']} - {book['author']}  ({len(chapters)} chapters)\n")
+    for n, c in enumerate(chapters, 1):
+        print(f"{n:3d}. {c['title']}  [{c['words']:,} words]")
+        if c.get("summary"):
+            print(f"     {c['summary'][:300]}")
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("query", nargs="?", help="book title (or author) to search for in Calibre-Web")
@@ -1689,6 +2209,8 @@ def main():
     ap.add_argument("--profile", default=setting("BOOK2PODCAST_PROFILE", "profile", "deep-dive"),
                     help="Open Notebook episode profile (default: deep-dive, as created by setup-profiles.sh)")
     ap.add_argument("--speakers", help="speaker profile (default: same name as --profile)")
+    ap.add_argument("--edit", action="store_true",
+                    help="place the chapter breaks by hand in a full-screen editor, starting from the saved split, then stop")
     ap.add_argument("--resplit", action="store_true", help="ignore cached chapters.json and split again")
     ap.add_argument("--no-notebook", action="store_true", help="don't add chapters as notebook sources")
     ap.add_argument("--no-podcast", action="store_true", help="only split (and add sources), no episodes")
@@ -1717,14 +2239,16 @@ def main():
     else:
         ap.error("give a book title to search for, or --file EPUB/PDF")
 
+    if args.edit:
+        book = edit_split(src, args.workdir, known, args.out)
+        if book:
+            show_chapters(book)
+        return
     book = split_book(src, args.workdir, args.resplit, known)
     chapters = book["chapters"]
     if args.list:
-        print(f"\n{book['title']} - {book['author']}  ({len(chapters)} chapters)\n")
-        for n, c in enumerate(chapters, 1):
-            print(f"{n:3d}. {c['title']}  [{c['words']:,} words]")
-            print(f"     {c['summary'][:300]}")
-        print(f"\nChapters are saved in {args.workdir / 'chapters.json'} (edit to adjust, --resplit to redo).")
+        show_chapters(book)
+        print(f"\nChapters are saved in {args.workdir / 'chapters.json'} (--edit to adjust, --resplit to redo).")
         print('Run without --list to generate every episode (or e.g. --chapters 1-3 for some).')
         return
 

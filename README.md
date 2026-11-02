@@ -109,8 +109,22 @@ dropped so the podcast writer never sees them.
 with a median under 1,500 words): numbered chapter headings are kept, or the
 LLM picks episode-sized units from the full list of titles and lengths.
 
-The result is cached in `~/.cache/book2podcast/<book>/chapters.json`; edit it
-to adjust a split by hand.
+The result is cached in `~/.cache/book2podcast/<book>/chapters.json`.
+
+### Fixing a split by hand
+
+`book2podcast "Some Book" --edit` opens the split in a full-screen editor: every
+line of the book's text in order, with its PDF page number, headings in bold,
+lines the table of contents or bookmarks point at marked `=`, and a bar where
+each chapter (or left-out stretch) begins, with its word count. Move to the
+first line of a chapter and press Enter to start one there; `x` leaves the text
+out from that line on (front matter, notes, index), Del removes a break, `t`
+renames a chapter, `p` jumps to a page, `/` searches, `u` undoes, `?` lists every
+key, `w` saves. New chapters are summarised on save. Finished episodes of
+chapters whose text you left unchanged are kept, under their new numbers; old
+MP3 files that no longer match a chapter number or title are listed, not
+deleted. A book that has not been split yet opens with no chapters, so you can
+skip automatic detection entirely.
 
 ### How well it works
 
@@ -257,6 +271,7 @@ first command in a real terminal.
 book2podcast "Some Book"                   # every chapter, saved to ~/Podcasts/Some Book/
 book2podcast "Some Book" --list            # only split, and show the chapters
 book2podcast "Some Book" --chapters 3-7    # some chapters
+book2podcast "Some Book" --edit            # place the chapter breaks by hand
 book2podcast --file ./book.pdf             # a local EPUB or PDF instead of Calibre-Web
 book2podcast "Some Book" -v                # also print every decision as it is made
 ```
@@ -282,8 +297,8 @@ with the rule or the model's reason behind it.
   [sudo rule](#let-book2podcast-restart-speaches) so it happens automatically.
 - **"Docling was killed ... out of memory".** Close large programs and re-run;
   Docling's work is cached per book once it finishes.
-- **A book splits badly.** Edit `~/.cache/book2podcast/<book>/chapters.json`
-  (merge entries by joining their `text`), or `--resplit -v` to see why.
+- **A book splits badly.** Fix it with `--edit` (see
+  [Fixing a split by hand](#fixing-a-split-by-hand)), or `--resplit -v` to see why.
 - **"Several books match".** Use the exact title; in a terminal you can also
   pick from the list.
 
